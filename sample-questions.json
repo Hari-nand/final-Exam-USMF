@@ -1,0 +1,42 @@
+[
+  {
+    "category": "Sample: General Knowledge",
+    "question": "Which planet is known as the Red Planet?",
+    "options": ["Venus", "Mars", "Jupiter", "Mercury"],
+    "answer": "B",
+    "explanation": "Iron oxide (rust) on the surface gives Mars its reddish colour."
+  },
+  {
+    "category": "Sample: General Knowledge",
+    "question": "What is the largest ocean on Earth?",
+    "options": ["Atlantic", "Indian", "Arctic", "Pacific"],
+    "answer": "D",
+    "explanation": "The Pacific covers about a third of the Earth's surface."
+  },
+  {
+    "category": "Sample: General Knowledge",
+    "question": "How many continents are there?",
+    "options": ["5", "6", "7", "8"],
+    "answer": "C"
+  },
+  {
+    "category": "Sample: Computing",
+    "question": "Which port does HTTPS use by default?",
+    "options": ["21", "80", "443", "8080"],
+    "answer": "C",
+    "explanation": "HTTP uses 80; HTTPS uses 443."
+  },
+  {
+    "category": "Sample: Computing",
+    "question": "What does CPU stand for?",
+    "options": ["Central Processing Unit", "Computer Personal Unit", "Central Program Utility", "Core Processing Unit"],
+    "answer": "A"
+  },
+  {
+    "category": "Sample: Computing",
+    "question": "Which of these is a strong password practice?",
+    "options": ["Reusing one password everywhere", "Using a long unique passphrase", "Writing it on a sticky note", "Using your birthday"],
+    "answer": "Using a long unique passphrase",
+    "explanation": "The answer can be a letter or the exact option text."
+  }
+]
