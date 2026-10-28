@@ -6,7 +6,7 @@ export const SUPABASE_URL = 'https://uzfzkosftfpyhhevjgee.supabase.co';
 export const SUPABASE_ANON_KEY = 'sb_publishable_dV225SliNliUkdV40zRwHQ_jQhKbrom';
 
 // Shown in the header and on the login page.
-export const APP_NAME = 'MCQ Practice';
+export const APP_NAME = 'USMF Exam Prep';
 
 // Shuffle answer options on each question (options such as "All of the above"
 // keep the original order automatically).
