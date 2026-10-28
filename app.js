@@ -1267,12 +1267,13 @@ async function importQuestions(items, skipDuplicates, onProgress) {
     const made = check(await sb.from('categories').insert([...toCreate.values()]).select('id,name,discipline_id'));
     made.forEach((t) => topicKey.set(t.name.toLowerCase(), t));
   }
-  const key = (cid, text) => cid + '|' + text.toLowerCase().replace(/\s+/g, ' ').trim();
+  const norm = (t) => String(t).toLowerCase().replace(/\s+/g, ' ').trim();
+  const key = (cid, text, options) => [cid, norm(text), ...options.map(norm)].join('|');
   const seen = new Set();
-  if (skipDuplicates) (await fetchAll(() => sb.from('questions').select('category_id,question').order('id'))).forEach((q) => seen.add(key(q.category_id, q.question)));
+  if (skipDuplicates) (await fetchAll(() => sb.from('questions').select('category_id,question,options').order('id'))).forEach((q) => seen.add(key(q.category_id, q.question, q.options)));
   const rows = []; let skipped = 0;
   for (const v of valid) {
-    const cid = topicKey.get(v.topic.toLowerCase()).id; const k = key(cid, v.question);
+    const cid = topicKey.get(v.topic.toLowerCase()).id; const k = key(cid, v.question, v.options);
     if (skipDuplicates && seen.has(k)) { skipped++; continue; }
     seen.add(k);
     rows.push({ category_id: cid, question: v.question, options: v.options, qtype: v.qtype, correct: v.correct, correct_index: v.correct[0], explanation: v.explanation });
@@ -1306,7 +1307,7 @@ async function renderAdminQuestions() {
       <section class="card" aria-labelledby="bi"><h2 id="bi">Bulk import</h2>
         <p class="muted small">Upload the question bank JSON. Missing disciplines and topics are created automatically.</p>
         <label class="field">JSON file<input type="file" id="file" accept=".json,application/json"></label>
-        <label class="choice" style="margin-bottom:12px"><input type="checkbox" id="skipDup" checked><span><b>Skip duplicates</b><small>Questions already in the same topic are not added again.</small></span></label>
+        <label class="choice" style="margin-bottom:12px"><input type="checkbox" id="skipDup" checked><span><b>Skip duplicates</b><small>Questions already in the same topic with the same options are not added again.</small></span></label>
         <button class="btn primary" id="importBtn" disabled>${icon('upload')}Import</button>
         <div class="import-progress" id="importResult" aria-live="polite"></div>
         <details style="margin-top:12px"><summary class="small">File format</summary><pre class="small" style="white-space:pre-wrap">[{ "discipline": "Cardiology",

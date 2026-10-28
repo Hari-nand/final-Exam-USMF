@@ -43,7 +43,7 @@ From *Teste examen absolvire ENG 2026*. Editable on the admin page.
 
 ## Question import format
 
-A JSON list. Disciplines and topics that don't exist yet are created automatically, and questions already in the same topic are skipped.
+A JSON list. Disciplines and topics that don't exist yet are created automatically, and a question already in the same topic with the same options is skipped.
 
 ```json
 [
