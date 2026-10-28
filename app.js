@@ -83,8 +83,8 @@ const store = {
 };
 const prefsKey = () => 'mcq-prefs:' + (state.profile ? state.profile.id : '');
 const draftKey = () => 'mcq-exam-draft:' + (state.profile ? state.profile.id : '');
-function download(filename, text) {
-  const url = URL.createObjectURL(new Blob([text], { type: 'application/json' }));
+function download(filename, text, type = 'application/json') {
+  const url = URL.createObjectURL(new Blob([text], { type }));
   const a = Object.assign(document.createElement('a'), { href: url, download: filename });
   document.body.appendChild(a); a.click(); a.remove();
   setTimeout(() => URL.revokeObjectURL(url), 1000);
@@ -311,8 +311,11 @@ function renderLogin() {
 
 async function renderHome() {
   const view = shell('home', loading);
-  const [meta, stats, sessions] = await Promise.all([loadMeta(), topicStats(state.profile.id), sessionsFor(state.profile.id)]);
+  const [meta, stats, sessions, pool] = await Promise.all([loadMeta(), topicStats(state.profile.id), sessionsFor(state.profile.id), loadPool()]);
   const totalQs = sum(meta.disciplines.map((d) => d.total));
+  const nUnused = pool.filter((q) => q.status === 'unused').length;
+  const nWrong = pool.filter((q) => q.status === 'incorrect').length;
+  const nMarked = pool.filter((q) => q.marked).length;
   if (!totalQs) {
     view.innerHTML = `<div class="card empty">${icon('book')}<h2>No questions yet</h2><p class="muted">${state.profile.role === 'admin'
       ? 'Import the question bank on the <a href="#/admin/questions">Admin → Questions</a> page.'
@@ -332,9 +335,9 @@ async function renderHome() {
 
   view.innerHTML = `
     <div class="page-head"><div><h1>${first ? 'Hello, ' + esc(first) : 'Welcome'}</h1>
-      <p class="muted">${overall.answered ? `${overall.answered.toLocaleString()} of ${totalQs.toLocaleString()} questions practised · ${overall.due} due for review` : `${totalQs.toLocaleString()} questions across ${meta.disciplines.filter((d) => d.total).length} disciplines are ready.`}</p></div></div>
+      <p class="muted">${overall.answered ? `${(totalQs - nUnused).toLocaleString()} of ${totalQs.toLocaleString()} questions used · ${nWrong.toLocaleString()} incorrect · ${nMarked.toLocaleString()} marked` : `${totalQs.toLocaleString()} questions across ${meta.disciplines.filter((d) => d.total).length} disciplines are ready.`}</p></div></div>
 
-    ${draft ? `<div class="card tight row-between" style="border-color:var(--warn)"><div class="row">${icon('clock')}<div><b>You have an unfinished mock exam.</b><br><span class="muted small">${esc(draft.label || '')}</span></div></div>
+    ${draft ? `<div class="card tight row-between" style="border-color:var(--warn)"><div class="row">${icon('clock')}<div><b>You have an unfinished test.</b><br><span class="muted small">${esc(draft.label || '')}</span></div></div>
       <a class="btn primary" href="#/exam/run">Resume exam</a></div>` : ''}
 
     <div class="grid stats">
@@ -349,12 +352,16 @@ async function renderHome() {
     <div class="grid two">
       <section class="card" aria-labelledby="hq1">
         <h2 id="hq1">Start studying</h2>
-        <p class="muted">Pick topics to drill, or sit a sample paper that follows the official exam weights.</p>
+        <p class="muted">Build a test from any subject, or sit a mock paper that follows the official exam weights.</p>
         <div class="btn-row">
-          <a class="btn primary lg" href="#/exam">${icon('exam')}Mock exam</a>
-          <a class="btn lg" href="#/practice">${icon('book')}Practise topics</a>
+          <a class="btn primary lg" href="#/practice">${icon('book')}Create a test</a>
+          <a class="btn lg" href="#/exam">${icon('exam')}Mock exam</a>
         </div>
-        ${overall.due ? `<p class="small" style="margin-top:16px">${icon('retry')} <a href="#/practice" data-due>${overall.due} questions are due for review</a></p>` : ''}
+        <div class="pool-links">
+          <button class="btn ghost sm" data-pool="unused" ${nUnused ? '' : 'disabled'}>${nUnused.toLocaleString()} unused</button>
+          <button class="btn ghost sm" data-pool="incorrect" ${nWrong ? '' : 'disabled'}>${nWrong.toLocaleString()} incorrect</button>
+          <button class="btn ghost sm" data-pool="marked" ${nMarked ? '' : 'disabled'}>${nMarked.toLocaleString()} marked</button>
+        </div>
       </section>
       <section class="card" aria-labelledby="hq2">
         <h2 id="hq2">Weakest topics</h2>
@@ -373,79 +380,132 @@ async function renderHome() {
   drawCurveInto(view.querySelector('#curve'), sessions);
   view.querySelectorAll('[data-drill]').forEach((b) => (b.onclick = async () => {
     b.disabled = true;
-    try { await startPractice({ catIds: [+b.dataset.drill], mode: 'smart', count: '20' }); } catch (e) { toast(errMsg(e), 'bad'); b.disabled = false; }
+    try { await startTest({ catIds: [+b.dataset.drill], mode: 'tutor', pools: ['unused', 'incorrect', 'marked', 'correct'], types: ['CS', 'CM'], count: 20 }, pool); } catch (e) { toast(errMsg(e), 'bad'); b.disabled = false; }
   }));
-  const due = view.querySelector('[data-due]');
-  if (due) due.onclick = (e) => { e.preventDefault(); store.set(prefsKey(), { ...(store.get(prefsKey()) || {}), mode: 'smart' }); location.hash = '#/practice'; };
+  // shortcuts: open the test builder with every subject and just that pool selected
+  view.querySelectorAll('[data-pool]').forEach((b) => (b.onclick = () => {
+    store.set(prefsKey(), { ...(store.get(prefsKey()) || {}), cats: meta.topics.filter((t) => meta.totals.get(t.id)).map((t) => t.id), pools: [b.dataset.pool], types: ['CS', 'CM'] });
+    location.hash = '#/practice';
+  }));
 }
 
 /* =========================================================================
-   Practice: topic picker
+   Create a test (UWorld-style builder)
    ========================================================================= */
+
+const QCOLS = 'id,category_id,question,options,qtype,correct,explanation';
+const POOLS = [
+  ['unused', 'Unused', 'Never answered'],
+  ['incorrect', 'Incorrect', 'Wrong the last time'],
+  ['marked', 'Marked', 'Flagged for review'],
+  ['correct', 'Correct', 'Right the last time'],
+];
+
+/** Every active question with this learner's status: unused / correct / incorrect, plus marked. */
+async function loadPool(uid = state.profile.id) {
+  const [qs, prog, marks] = await Promise.all([
+    fetchAll(() => sb.from('questions').select('id,category_id,qtype').eq('active', true).order('id')),
+    fetchAll(() => sb.from('progress').select('question_id,last_correct').eq('user_id', uid).order('question_id')),
+    fetchAll(() => sb.from('marks').select('question_id').eq('user_id', uid).order('question_id')),
+  ]);
+  const last = new Map(prog.map((p) => [p.question_id, p.last_correct]));
+  const marked = new Set(marks.map((m) => m.question_id));
+  if (uid === state.profile.id) state.marks = marked;
+  return qs.map((q) => ({ id: q.id, cat: q.category_id, type: q.qtype,
+    status: !last.has(q.id) ? 'unused' : last.get(q.id) ? 'correct' : 'incorrect', marked: marked.has(q.id) }));
+}
+const inPools = (q, pools) => pools.includes(q.status) || (q.marked && pools.includes('marked'));
+
+async function toggleMark(qid) {
+  const marked = state.marks?.has(qid);
+  if (!state.marks) state.marks = new Set();
+  if (marked) { state.marks.delete(qid); const { error } = await sb.from('marks').delete().eq('user_id', state.profile.id).eq('question_id', qid); if (error) { state.marks.add(qid); toast(errMsg(error), 'bad'); } }
+  else { state.marks.add(qid); const { error } = await sb.from('marks').insert({ user_id: state.profile.id, question_id: qid }); if (error && !/duplicate/i.test(error.message)) { state.marks.delete(qid); toast(errMsg(error), 'bad'); } }
+  return state.marks.has(qid);
+}
 
 async function renderPractice() {
   const view = shell('practice', loading);
-  const [meta, stats] = await Promise.all([loadMeta(), topicStats(state.profile.id)]);
+  const [meta, pool] = await Promise.all([loadMeta(), loadPool()]);
   const discs = meta.disciplines.filter((d) => d.total);
   if (!discs.length) { view.innerHTML = `<div class="card empty">${icon('book')}<h2>No questions yet</h2></div>`; return; }
 
   const prefs = store.get(prefsKey()) || {};
   const valid = new Set(meta.topics.filter((t) => meta.totals.get(t.id)).map((t) => t.id));
   const selected = new Set((prefs.cats || []).filter((id) => valid.has(id)));
-  const mode = prefs.mode || 'smart';
-  const count = prefs.count || '20';
-
-  const topicRow = (t, d) => {
-    const s = stats.get(t.id); const total = meta.totals.get(t.id) || 0;
-    if (!total) return '';
-    const acc = s ? pctNum(s.correct, s.attempts) : null;
-    return `<label class="topic"><input type="checkbox" value="${t.id}" data-disc="${d.id}" ${selected.has(t.id) ? 'checked' : ''}>
-      <span class="tname">${esc(t.name)}</span>
-      <span class="tmeta">${s ? s.answered : 0}/${total}${acc !== null ? ` · <span class="acc ${accClass(acc)}">${acc}%</span>` : ''}${s && s.due ? ` · <span class="chip warn">${s.due} due</span>` : ''}</span></label>`;
-  };
+  const mode = prefs.testMode || 'tutor';
+  const timed = prefs.testTimed !== false;
+  const pools = prefs.pools || ['unused'];
+  const types = prefs.types || ['CS', 'CM'];
+  const count = prefs.testCount || 20;
 
   view.innerHTML = `
-    <div class="page-head"><div><h1>Practise by topic</h1><p class="muted">Choose disciplines or individual topics. Answers are checked against the official key as you go.</p></div></div>
+    <div class="page-head"><div><h1>Create a test</h1><p class="muted">Work through a subject one pass at a time: unused questions first, then your incorrect ones, then mixed blocks. Answers are marked against the official key.</p></div></div>
+
+    <section class="card" aria-labelledby="tm">
+      <fieldset><legend id="tm">Test mode</legend>
+        <div class="choices">
+          <label class="choice"><input type="radio" name="tmode" value="tutor" ${mode === 'tutor' ? 'checked' : ''}><span><b>Tutor</b><small>See the answer and key after each question.</small></span></label>
+          <label class="choice"><input type="radio" name="tmode" value="exam" ${mode === 'exam' ? 'checked' : ''}><span><b>Exam</b><small>Answer the whole block, then see your score and review.</small></span></label>
+        </div>
+      </fieldset>
+      <label class="choice" id="timedWrap" style="margin-top:8px"><input type="checkbox" id="timed" ${timed ? 'checked' : ''}><span><b>Timed</b><small>One minute per question, like the real exam.</small></span></label>
+    </section>
+
+    <section class="card" aria-labelledby="tp">
+      <fieldset><legend id="tp">Question pool</legend>
+        <div class="choices four">${POOLS.map(([v, t, s]) => `<label class="choice"><input type="checkbox" name="pool" value="${v}" ${pools.includes(v) ? 'checked' : ''}><span><b>${t} <span class="count num" data-pc="${v}"></span></b><small>${s}</small></span></label>`).join('')}</div>
+      </fieldset>
+      <fieldset style="margin-top:16px"><legend>Question type</legend>
+        <div class="choices">
+          <label class="choice"><input type="checkbox" name="qtype" value="CS" ${types.includes('CS') ? 'checked' : ''}><span><b>Single answer (CS) <span class="count num" data-tc="CS"></span></b><small>One correct option</small></span></label>
+          <label class="choice"><input type="checkbox" name="qtype" value="CM" ${types.includes('CM') ? 'checked' : ''}><span><b>Multiple answers (CM) <span class="count num" data-tc="CM"></span></b><small>Two or more correct options</small></span></label>
+        </div>
+      </fieldset>
+    </section>
+
     <section class="card" aria-labelledby="pt">
-      <div class="row-between"><h2 id="pt">Topics</h2>
+      <div class="row-between"><h2 id="pt">Subjects</h2>
         <div class="btn-row"><button class="btn sm" data-all>Select all</button><button class="btn sm ghost" data-none>Clear</button></div></div>
+      <p class="muted small">Numbers show how many questions match the pool and type you picked.</p>
       ${discs.map((d) => `
-        <details class="disc" ${d.topics.some((t) => selected.has(t.id)) ? 'open' : ''}>
+        <details class="disc" ${d.topics.some((t) => selected.has(t.id)) && !d.topics.every((t) => !valid.has(t.id) || selected.has(t.id)) ? 'open' : ''}>
           <summary>
             <input type="checkbox" data-discall="${d.id}" aria-label="Select all ${esc(d.name)} topics">
-            <span><span class="dname">${esc(d.name)}</span><br><span class="dmeta">${d.total} questions · ${d.weight}% of the exam · ${d.topics.filter((t) => meta.totals.get(t.id)).length} topic${d.topics.length === 1 ? '' : 's'}</span></span>
+            <span><span class="dname">${esc(d.name)}</span><br><span class="dmeta"><span data-dc="${d.id}"></span> · ${d.total} in total · ${d.weight}% of the exam</span></span>
             <span class="chev">${icon('right')}</span>
           </summary>
-          <div class="topics">${d.topics.map((t) => topicRow(t, d)).join('')}</div>
+          <div class="topics">${d.topics.filter((t) => valid.has(t.id)).map((t) => `<label class="topic"><input type="checkbox" value="${t.id}" data-disc="${d.id}" ${selected.has(t.id) ? 'checked' : ''}>
+            <span class="tname">${esc(t.name)}</span><span class="tmeta" data-tcnt="${t.id}"></span></label>`).join('')}</div>
         </details>`).join('')}
     </section>
 
-    <section class="card" aria-labelledby="pm">
-      <fieldset><legend id="pm">Mode</legend>
-        <div class="choices">
-          ${[['smart', 'Smart review', 'Due and new questions first. Best for daily study.'],
-             ['random', 'Random', 'Any questions from your selection, shuffled.'],
-             ['mistakes', 'My mistakes', 'Only questions you got wrong last time.']]
-            .map(([v, t, s]) => `<label class="choice"><input type="radio" name="mode" value="${v}" ${mode === v ? 'checked' : ''}><span><b>${t}</b><small>${s}</small></span></label>`).join('')}
-        </div>
-      </fieldset>
-      <label class="field" style="max-width:220px">Questions per session
-        <select id="count">${['10', '20', '30', '50', '100', 'all'].map((n) => `<option value="${n}" ${count === n ? 'selected' : ''}>${n === 'all' ? 'All' : n}</option>`).join('')}</select></label>
+    <section class="card" aria-labelledby="tn">
+      <h2 id="tn">Number of questions</h2>
+      <div class="row">
+        <label class="field" style="max-width:160px;margin:0"><span class="sr">Number of questions</span><input type="number" id="count" min="1" max="500" step="1" value="${count}" inputmode="numeric"></label>
+        <div class="btn-row">${[10, 20, 50, 100].map((n) => `<button class="btn sm" data-n="${n}">${n}</button>`).join('')}<button class="btn sm" id="maxBtn">Max</button></div>
+      </div>
+      <p class="help" id="countHelp"></p>
     </section>
 
     <div class="sticky-start"><div class="start-bar">
       <span id="selInfo" class="muted" aria-live="polite"></span>
-      <button class="btn primary lg" id="start">Start practice ${icon('right')}</button>
+      <button class="btn primary lg" id="start">Create test ${icon('right')}</button>
     </div></div>`;
 
   const topicBoxes = [...view.querySelectorAll('.topic input')];
   const discBoxes = [...view.querySelectorAll('[data-discall]')];
-  const info = view.querySelector('#selInfo');
+  const countEl = view.querySelector('#count');
   const opts = () => ({
     catIds: topicBoxes.filter((b) => b.checked).map((b) => +b.value),
-    mode: view.querySelector('input[name=mode]:checked').value,
-    count: view.querySelector('#count').value,
+    mode: view.querySelector('input[name=tmode]:checked').value,
+    timed: view.querySelector('#timed').checked,
+    pools: [...view.querySelectorAll('input[name=pool]:checked')].map((b) => b.value),
+    types: [...view.querySelectorAll('input[name=qtype]:checked')].map((b) => b.value),
+    count: Math.max(1, Math.floor(+countEl.value || 0)),
   });
+  let available = 0;
   const sync = () => {
     for (const db of discBoxes) {
       const mine = topicBoxes.filter((b) => b.dataset.disc === db.dataset.discall);
@@ -453,11 +513,22 @@ async function renderPractice() {
       db.checked = n === mine.length && n > 0; db.indeterminate = n > 0 && n < mine.length;
     }
     const o = opts();
-    store.set(prefsKey(), { cats: o.catIds, mode: o.mode, count: o.count });
-    const total = sum(o.catIds.map((id) => meta.totals.get(id) || 0));
-    const due = sum(o.catIds.map((id) => (stats.get(id) || {}).due || 0));
-    info.textContent = o.catIds.length ? `${o.catIds.length} topic${o.catIds.length > 1 ? 's' : ''} · ${total} questions${o.mode === 'smart' ? ` · ${due} due` : ''}` : 'Select at least one topic';
-    view.querySelector('#start').disabled = !o.catIds.length;
+    view.querySelector('#timedWrap').hidden = o.mode !== 'exam';
+    store.set(prefsKey(), { ...(store.get(prefsKey()) || {}), cats: o.catIds, testMode: o.mode, testTimed: o.timed, pools: o.pools, types: o.types, testCount: o.count });
+    const cats = new Set(o.catIds);
+    const scope = cats.size ? pool.filter((q) => cats.has(q.cat)) : pool;
+    // pool counts within selected subjects and types; type counts within selected subjects and pools
+    for (const [v] of POOLS) view.querySelector(`[data-pc=${v}]`).textContent = `(${scope.filter((q) => o.types.includes(q.type) && inPools(q, [v])).length})`;
+    for (const t of ['CS', 'CM']) view.querySelector(`[data-tc=${t}]`).textContent = `(${scope.filter((q) => q.type === t && inPools(q, o.pools)).length})`;
+    const match = pool.filter((q) => o.types.includes(q.type) && inPools(q, o.pools));
+    const byCat = new Map(); for (const q of match) byCat.set(q.cat, (byCat.get(q.cat) || 0) + 1);
+    for (const t of meta.topics) { const el = view.querySelector(`[data-tcnt="${t.id}"]`); if (el) el.textContent = `${byCat.get(t.id) || 0} / ${meta.totals.get(t.id) || 0}`; }
+    for (const d of discs) view.querySelector(`[data-dc="${d.id}"]`).textContent = `${sum(d.topics.map((t) => byCat.get(t.id) || 0))} available`;
+    available = match.filter((q) => cats.has(q.cat)).length;
+    const n = Math.min(o.count, available);
+    view.querySelector('#countHelp').textContent = cats.size ? `${available} questions available in your selection.` : 'Pick at least one subject.';
+    view.querySelector('#selInfo').textContent = !cats.size ? 'Select at least one subject' : !o.pools.length ? 'Pick at least one question pool' : !o.types.length ? 'Pick at least one question type' : !available ? 'No questions match these filters' : `${n} question${n === 1 ? '' : 's'} · ${o.mode === 'exam' ? (o.timed ? `exam, ${n} min` : 'exam, untimed') : 'tutor'}`;
+    view.querySelector('#start').disabled = !available;
   };
   discBoxes.forEach((db) => db.addEventListener('change', () => {
     topicBoxes.filter((b) => b.dataset.disc === db.dataset.discall).forEach((b) => (b.checked = db.checked));
@@ -465,50 +536,61 @@ async function renderPractice() {
   }));
   view.querySelector('[data-all]').onclick = () => { topicBoxes.forEach((b) => (b.checked = true)); sync(); };
   view.querySelector('[data-none]').onclick = () => { topicBoxes.forEach((b) => (b.checked = false)); sync(); };
+  view.querySelectorAll('[data-n]').forEach((b) => (b.onclick = () => { countEl.value = b.dataset.n; sync(); }));
+  view.querySelector('#maxBtn').onclick = () => { countEl.value = Math.max(1, available); sync(); };
   view.addEventListener('change', (e) => { if (!e.target.dataset.discall) sync(); });
+  countEl.addEventListener('input', sync);
   sync();
 
   view.querySelector('#start').onclick = async (ev) => {
     const btn = ev.currentTarget;
-    btn.disabled = true; btn.textContent = 'Loading…';
-    try { if (!(await startPractice(opts()))) { btn.disabled = false; btn.innerHTML = `Start practice ${icon('right')}`; } }
-    catch (e) { toast(errMsg(e), 'bad'); btn.disabled = false; btn.innerHTML = `Start practice ${icon('right')}`; }
+    btn.disabled = true; btn.textContent = 'Building test…';
+    try { if (!(await startTest(opts(), pool))) { btn.disabled = false; btn.innerHTML = `Create test ${icon('right')}`; } }
+    catch (e) { toast(errMsg(e), 'bad'); btn.disabled = false; btn.innerHTML = `Create test ${icon('right')}`; }
   };
 }
 
-const QCOLS = 'id,category_id,question,options,qtype,correct,explanation';
-
-async function startPractice(opts, preset) {
-  const meta = await loadMeta();
-  let picked;
-  if (preset) picked = shuffle(preset);
-  else {
-    const { catIds, mode, count } = opts;
-    const qs = await inChunks(catIds, 40, (ids) => fetchAll(() => sb.from('questions').select(QCOLS).in('category_id', ids).eq('active', true).order('id')));
-    const prog = await fetchAll(() => sb.from('progress').select('question_id,box,due_at,last_correct').eq('user_id', state.profile.id).order('question_id'));
-    const pm = new Map(prog.map((p) => [p.question_id, p]));
-    let pool;
-    if (mode === 'mistakes') {
-      pool = shuffle(qs.filter((q) => pm.get(q.id)?.last_correct === false));
-      if (!pool.length) { toast('No mistakes to review in these topics. Well done!', 'ok'); return false; }
-    } else if (mode === 'random') pool = shuffle(qs);
-    else {
-      const now = Date.now(); const due = [], fresh = [], later = [];
-      for (const q of qs) { const p = pm.get(q.id); if (!p) fresh.push(q); else if (new Date(p.due_at).getTime() <= now) due.push(q); else later.push(q); }
-      later.sort((a, b) => new Date(pm.get(a.id).due_at) - new Date(pm.get(b.id).due_at));
-      pool = [...shuffle(due).sort((a, b) => pm.get(a.id).box - pm.get(b.id).box), ...shuffle(fresh), ...later];
-    }
-    if (!pool.length) { toast('No questions found for that selection.', 'bad'); return false; }
-    picked = count === 'all' ? pool : pool.slice(0, +count);
-    if (mode === 'smart') picked = shuffle(picked);
+function testLabel(meta, catIds, pools) {
+  const cats = new Set(catIds);
+  const parts = [];
+  for (const d of meta.disciplines) {
+    const mine = d.topics.filter((t) => meta.totals.get(t.id));
+    const chosen = mine.filter((t) => cats.has(t.id));
+    if (!chosen.length) continue;
+    if (chosen.length === mine.length) parts.push(d.name); else parts.push(...chosen.map((t) => t.name));
   }
-  const names = [...new Set(picked.map((q) => meta.topicById.get(q.category_id)?.name).filter(Boolean))];
-  const label = names.length === 1 ? names[0] : names.length <= 3 ? names.join(', ') : `${names.length} topics`;
-  const sessionId = check(await sb.rpc('start_session', { p_mode: preset ? 'review' : 'topic', p_label: label, p_total: picked.length }));
-  state.run = { opts, sessionId, label, i: 0, startedAt: Date.now(),
-    items: picked.map((q) => ({ q, order: optionOrder(q.options), sel: new Set(), done: false, ok: null, saved: null })) };
-  if (location.hash === '#/session') renderSession(); else location.hash = '#/session';
+  const subj = parts.length <= 2 ? parts.join(', ') : `${parts.length} subjects`;
+  const pl = pools.length === POOLS.length ? 'All' : pools.map((p) => POOLS.find((x) => x[0] === p)[1]).join(' + ');
+  return `${subj} · ${pl}`;
+}
+
+async function fetchQuestions(ids) {
+  const qs = await inChunks(ids, 100, (chunk) => fetchAll(() => sb.from('questions').select(QCOLS).in('id', chunk).order('id')));
+  const byId = new Map(qs.map((q) => [q.id, q]));
+  return ids.map((id) => byId.get(id)).filter(Boolean);
+}
+
+/** Build a test from builder options. `pool` may be passed in to skip reloading it. */
+async function startTest(o, pool) {
+  const meta = await loadMeta();
+  pool = pool || (await loadPool());
+  const cats = new Set(o.catIds);
+  const match = pool.filter((q) => cats.has(q.cat) && o.types.includes(q.type) && inPools(q, o.pools));
+  if (!match.length) { toast('No questions match that selection.', 'bad'); return false; }
+  const ids = shuffle(match).slice(0, o.count).map((q) => q.id);
+  const qs = await fetchQuestions(ids);
+  const label = testLabel(meta, o.catIds, o.pools);
+  if (o.mode === 'exam') { await startExamWith(qs, { mode: 'topic', label, timed: o.timed, opts: o }); return true; }
+  await startTutor(qs, label, o);
   return true;
+}
+
+async function startTutor(qs, label, opts, review = false) {
+  const sessionId = check(await sb.rpc('start_session', { p_mode: review ? 'review' : 'topic', p_label: label, p_total: qs.length }));
+  if (!state.marks) await loadPool();
+  state.run = { opts, sessionId, label, i: 0, startedAt: Date.now(),
+    items: qs.map((q) => ({ q, order: optionOrder(q.options), sel: new Set(), done: false, ok: null, saved: null })) };
+  if (location.hash === '#/session') renderSession(); else location.hash = '#/session';
 }
 
 /* =========================================================================
@@ -560,17 +642,22 @@ function renderSession() {
         </div>
         <div class="progress" role="progressbar" aria-valuemin="0" aria-valuemax="${n}" aria-valuenow="${run.i}" aria-label="Session progress"><span style="width:${(100 * run.i) / n}%"></span></div>
         <article class="card qcard" aria-labelledby="qtext">
-          <div class="qmeta">${disc ? `<span class="chip pri">${esc(disc.name)}</span>` : ''}${topic && topic.name !== disc?.name ? `<span class="chip">${esc(topic.name)}</span>` : ''}<span class="chip">${multi ? 'Multiple answers' : 'Single answer'}</span></div>
+          <div class="qmeta">${disc ? `<span class="chip pri">${esc(disc.name)}</span>` : ''}${topic && topic.name !== disc?.name ? `<span class="chip">${esc(topic.name)}</span>` : ''}<span class="chip">${multi ? 'Multiple answers' : 'Single answer'}</span><button class="btn ghost sm mark-btn" id="markBtn" aria-pressed="${!!state.marks?.has(q.id)}">${icon('flag')}${state.marks?.has(q.id) ? 'Marked' : 'Mark'}</button></div>
           <h1 class="qtext" id="qtext">${esc(q.question)}</h1>
           <p class="qhint">${multi ? 'Select all correct answers, then check.' : 'Select one answer.'}</p>
           <div class="options" role="${multi ? 'group' : 'radiogroup'}" aria-labelledby="qtext">${optionButtons(it, { reveal: it.done })}</div>
           <div class="run-actions" id="actions"></div>
           <div class="feedback" id="feedback" aria-live="polite"></div>
         </article>
-        <p class="keys-hint">Keys: A–${LETTERS[q.options.length - 1]} choose · Enter ${multi ? 'check / ' : ''}next</p>
+        <p class="keys-hint">Keys: A–${LETTERS[q.options.length - 1]} choose · Enter ${multi ? 'check / ' : ''}next · M mark</p>
       </div>
     </div>`);
 
+  view.querySelector('#markBtn').onclick = async (ev) => {
+    const b = ev.currentTarget; b.disabled = true;
+    const on = await toggleMark(q.id);
+    b.disabled = false; b.setAttribute('aria-pressed', String(on)); b.innerHTML = `${icon('flag')}${on ? 'Marked' : 'Mark'}`;
+  };
   view.querySelector('#quit').onclick = () => {
     const answered = run.items.filter((x) => x.done).length;
     if (!answered || confirm('End this session? Your answers so far are saved.')) { run.ended = true; renderSessionSummary(); }
@@ -641,16 +728,16 @@ function renderSessionSummary() {
         <p class="muted">${right} of ${done.length} correct${done.length < run.items.length ? ` · ${run.items.length - done.length} not answered` : ''} · ${esc(run.label)}</p>
         ${done.some((x) => x.saved === false) ? `<p class="chip bad">${icon('alert')}Some answers were not saved because of a connection problem.</p>` : ''}
         <div class="btn-row">
-          ${run.opts ? `<button class="btn primary" id="again">${icon('retry')}Practise again</button>` : ''}
+          ${run.opts ? `<button class="btn primary" id="again">${icon('retry')}New test, same settings</button>` : ''}
           ${wrong.length ? `<button class="btn" id="retryWrong">Retry the ${wrong.length} I missed</button>` : ''}
-          <a class="btn ghost" href="#/practice">Change topics</a>
+          <a class="btn ghost" href="#/practice">Change settings</a>
         </div>
       </div></div></section>
     ${wrong.length ? `<section class="card"><h2>Review your mistakes</h2><ol class="review">${wrong.map((it) => reviewItem(it)).join('')}</ol></section>` : ''}`);
   const again = view.querySelector('#again');
-  if (again) again.onclick = async () => { again.disabled = true; try { if (!(await startPractice(run.opts))) again.disabled = false; } catch (e) { toast(errMsg(e), 'bad'); again.disabled = false; } };
+  if (again) again.onclick = async () => { again.disabled = true; try { if (!(await startTest(run.opts))) again.disabled = false; } catch (e) { toast(errMsg(e), 'bad'); again.disabled = false; } };
   const rw = view.querySelector('#retryWrong');
-  if (rw) rw.onclick = () => startPractice(run.opts, wrong.map((x) => x.q)).catch((e) => toast(errMsg(e), 'bad'));
+  if (rw) rw.onclick = () => startTutor(shuffle(wrong.map((x) => x.q)), 'Retry: ' + run.label, run.opts, true).catch((e) => toast(errMsg(e), 'bad'));
 }
 
 function reviewItem(it, meta = state.meta) {
@@ -658,7 +745,7 @@ function reviewItem(it, meta = state.meta) {
   const topic = meta?.topicById.get(q.category_id);
   const v = it.sel.size ? verdictFor(q, it.sel) : { cls: 'bad', text: 'Not answered', icon: 'x' };
   return `<li>
-    <div class="qmeta"><span class="chip ${v.cls === 'ok' ? 'ok' : v.cls === 'part' ? 'warn' : 'bad'}">${icon(v.icon)}${v.text}</span>${topic ? `<span class="chip">${esc(topic.name)}</span>` : ''}${it.flagged ? `<span class="chip warn">${icon('flag')}Flagged</span>` : ''}</div>
+    <div class="qmeta"><span class="chip ${v.cls === 'ok' ? 'ok' : v.cls === 'part' ? 'warn' : 'bad'}">${icon(v.icon)}${v.text}</span>${topic ? `<span class="chip">${esc(topic.name)}</span>` : ''}${it.flagged ? `<span class="chip warn">${icon('flag')}Marked</span>` : ''}</div>
     <p class="rq">${esc(q.question)}</p>
     <ul class="ropts">${it.order.map((orig, pos) => {
       const key = q.correct.includes(orig); const chosen = it.sel.has(orig);
@@ -686,7 +773,9 @@ document.addEventListener('keydown', (e) => {
   if (h === '#/exam/run') {
     if (e.key === 'ArrowRight') { const b = document.getElementById('exNext'); if (b && !b.disabled) b.click(); }
     if (e.key === 'ArrowLeft') { const b = document.getElementById('exPrev'); if (b && !b.disabled) b.click(); }
-    if (k === 'F' && !LETTERS.slice(0, 5).includes('F')) { const b = document.getElementById('exFlag'); if (b) b.click(); }
+  }
+  if (k === 'M') { const b = document.getElementById('exFlag') || document.getElementById('markBtn'); if (b && !b.disabled) { e.preventDefault(); b.click(); } }
+  {
   }
 });
 
@@ -709,93 +798,144 @@ function allocate(n, discs) {
   return rows;
 }
 
+const MOCK_POOLS = [
+  ['new', 'New questions first', 'Unanswered questions, by the exam weights. Repeats come in only when a discipline has none left (your incorrect ones first).'],
+  ['incorrect', 'Incorrect only', 'Second round: only questions you got wrong, still by the exam weights.'],
+  ['any', 'Any questions', 'Random from the whole bank, ignoring what you have done.'],
+];
+
+/** Questions grouped by discipline, with this learner's status. */
+function poolByDisc(meta, pool) {
+  const by = new Map(meta.disciplines.map((d) => [d.id, { all: [], unused: [], incorrect: [], correct: [] }]));
+  for (const q of pool) {
+    const t = meta.topicById.get(q.cat); const g = t && by.get(t.discipline_id); if (!g) continue;
+    g.all.push(q); g[q.status].push(q);
+  }
+  return by;
+}
+
 async function renderExamSetup() {
   const view = shell('exam', loading);
-  const meta = await loadMeta();
+  const [meta, pool] = await Promise.all([loadMeta(), loadPool()]);
   const draft = store.get(draftKey());
   const totalQs = sum(meta.disciplines.map((d) => d.total));
   if (!totalQs) { view.innerHTML = `<div class="card empty">${icon('exam')}<h2>No questions yet</h2></div>`; return; }
   const prefs = store.get(prefsKey()) || {};
-  const size = String(prefs.examSize || 100);
+  const size = String(prefs.examSize || 50);
   const timed = prefs.examTimed !== false;
+  const by = poolByDisc(meta, pool);
+  const nNew = pool.filter((q) => q.status === 'unused').length;
+  const nWrong = pool.filter((q) => q.status === 'incorrect').length;
+  const mpool = prefs.mockPool && (prefs.mockPool !== 'incorrect' || nWrong) ? prefs.mockPool : 'new';
 
   view.innerHTML = `
-    <div class="page-head"><div><h1>Mock exam</h1><p class="muted">A sample paper drawn at random from the whole bank, with questions per discipline set by the official exam weights. Answers are revealed after you submit.</p></div></div>
-    ${draft ? `<div class="card tight row-between" style="border-color:var(--warn)"><div class="row">${icon('clock')}<b>You have an unfinished exam: ${esc(draft.label || '')}</b></div><div class="btn-row"><a class="btn primary" href="#/exam/run">Resume</a><button class="btn ghost" id="discard">Discard</button></div></div>` : ''}
+    <div class="page-head"><div><h1>Mock exam</h1><p class="muted">A paper built to the official exam weights. Answers are revealed after you submit.</p></div></div>
+    ${draft ? `<div class="card tight row-between" style="border-color:var(--warn)"><div class="row">${icon('clock')}<b>You have an unfinished test: ${esc(draft.label || '')}</b></div><div class="btn-row"><a class="btn primary" href="#/exam/run">Resume</a><button class="btn ghost" id="discard">Discard</button></div></div>` : ''}
     <div class="grid two">
       <section class="card" aria-labelledby="es">
+        <fieldset><legend>Questions</legend>
+          <div class="choices one">${MOCK_POOLS.map(([v, t, s]) => {
+            const n = v === 'new' ? nNew : v === 'incorrect' ? nWrong : totalQs;
+            return `<label class="choice"><input type="radio" name="mpool" value="${v}" ${mpool === v ? 'checked' : ''} ${v === 'incorrect' && !nWrong ? 'disabled' : ''}><span><b>${t} <span class="count num">(${n.toLocaleString()})</span></b><small>${s}</small></span></label>`;
+          }).join('')}</div>
+        </fieldset>
         <fieldset><legend id="es">Paper length</legend>
-          <div class="choices">${[50, 100, 150, 200].map((n) => `<label class="choice"><input type="radio" name="size" value="${n}" ${size === String(n) ? 'checked' : ''}><span><b>${n} questions</b><small>${n === 100 ? 'Recommended' : n < 100 ? 'Quick check' : 'Full stamina test'}</small></span></label>`).join('')}</div>
+          <div class="choices">${[50, 100, 150, 200].map((n) => `<label class="choice"><input type="radio" name="size" value="${n}" ${size === String(n) ? 'checked' : ''}><span><b>${n} questions</b><small>${n === 50 ? 'One block' : n === 100 ? 'Half paper' : 'Stamina test'}</small></span></label>`).join('')}</div>
         </fieldset>
         <label class="choice" style="margin-bottom:16px"><input type="checkbox" id="timed" ${timed ? 'checked' : ''}><span><b>Timed</b><small>One minute per question. The paper submits itself when time runs out.</small></span></label>
+        <p class="muted small" id="runway" aria-live="polite"></p>
         <button class="btn primary lg block" id="go">${icon('exam')}Start mock exam</button>
       </section>
       <section class="card" aria-labelledby="eb">
         <h2 id="eb">Exam blueprint</h2>
-        <p class="muted small">From the 2026 graduation exam test collection. Questions per paper update with the length you pick.</p>
-        <div class="table-wrap"><table><thead><tr><th>Discipline</th><th class="n">Weight</th><th class="n">In paper</th><th class="n">In bank</th></tr></thead><tbody id="bp"></tbody></table></div>
+        <p class="muted small">From the 2026 graduation exam test collection. "In paper" updates with your choices.</p>
+        <div class="table-wrap"><table><thead><tr><th>Discipline</th><th class="n">Weight</th><th class="n">In paper</th><th class="n">New left</th><th class="n">Incorrect</th></tr></thead><tbody id="bp"></tbody></table></div>
       </section>
     </div>`;
 
   const bp = view.querySelector('#bp');
+  const choice = () => ({ n: +view.querySelector('input[name=size]:checked').value, mpool: view.querySelector('input[name=mpool]:checked').value, timed: view.querySelector('#timed').checked });
   const draw = () => {
-    const n = +view.querySelector('input[name=size]:checked').value;
-    const rows = allocate(n, meta.disciplines);
+    const c = choice();
+    const capped = meta.disciplines.map((d) => ({ ...d, total: c.mpool === 'incorrect' ? by.get(d.id).incorrect.length : by.get(d.id).all.length }));
+    const rows = allocate(c.n, capped);
     const byId = new Map(rows.map((r) => [r.d.id, r.k]));
     let lastProfile = '';
     bp.innerHTML = meta.disciplines.filter((d) => d.total || d.weight).map((d) => {
-      const head = d.profile !== lastProfile ? `<tr class="group"><td colspan="4">${esc(d.profile)}</td></tr>` : '';
+      const g = by.get(d.id);
+      const head = d.profile !== lastProfile ? `<tr class="group"><td colspan="5">${esc(d.profile)}</td></tr>` : '';
       lastProfile = d.profile;
-      return head + `<tr><td>${esc(d.name)}</td><td class="n">${d.weight}%</td><td class="n"><b>${byId.get(d.id) || 0}</b></td><td class="n muted">${d.total}</td></tr>`;
-    }).join('') + `<tr><td><b>Total</b></td><td class="n">${sum(meta.disciplines.map((d) => d.weight))}%</td><td class="n"><b>${sum(rows.map((r) => r.k))}</b></td><td class="n muted">${totalQs}</td></tr>`;
+      const low = c.mpool === 'new' && (byId.get(d.id) || 0) > g.unused.length;
+      return head + `<tr><td>${esc(d.name)}</td><td class="n">${d.weight}%</td><td class="n"><b>${byId.get(d.id) || 0}</b></td><td class="n ${low ? 'acc lo' : ''}">${g.unused.length}</td><td class="n">${g.incorrect.length}</td></tr>`;
+    }).join('') + `<tr><td><b>Total</b></td><td class="n">${sum(meta.disciplines.map((d) => d.weight))}%</td><td class="n"><b>${sum(rows.map((r) => r.k))}</b></td><td class="n">${nNew}</td><td class="n">${nWrong}</td></tr>`;
+    // how many more papers of this size before the first discipline runs out of new questions
+    const runway = rows.filter((r) => r.k > 0).map((r) => Math.floor(by.get(r.d.id).unused.length / r.k));
+    const left = runway.length ? Math.min(...runway) : 0;
+    const total = sum(rows.map((r) => r.k));
+    view.querySelector('#runway').textContent = c.mpool === 'new'
+      ? (left ? `About ${left} more ${c.n}-question paper${left === 1 ? '' : 's'} of all-new questions before the first discipline runs out. After that, that discipline repeats your incorrect questions first.` : 'At least one discipline has run out of new questions, so this paper will include some repeats (incorrect ones first).')
+      : c.mpool === 'incorrect' ? (total < c.n ? `You have ${total} incorrect questions in weighted disciplines, so this paper will have ${total}.` : '') : '';
+    view.querySelector('#go').disabled = !total;
   };
   view.addEventListener('change', () => {
-    store.set(prefsKey(), { ...(store.get(prefsKey()) || {}), examSize: +view.querySelector('input[name=size]:checked').value, examTimed: view.querySelector('#timed').checked });
+    const c = choice();
+    store.set(prefsKey(), { ...(store.get(prefsKey()) || {}), examSize: c.n, examTimed: c.timed, mockPool: c.mpool });
     draw();
   });
   draw();
   const discard = view.querySelector('#discard');
-  if (discard) discard.onclick = () => { if (confirm('Discard the unfinished exam? Nothing from it will be saved.')) { store.del(draftKey()); state.exam = null; renderExamSetup(); } };
+  if (discard) discard.onclick = () => { if (confirm('Discard the unfinished test? Nothing from it will be saved.')) { store.del(draftKey()); state.exam = null; renderExamSetup(); } };
 
   view.querySelector('#go').onclick = async (ev) => {
-    if (draft && !confirm('Starting a new exam discards your unfinished one. Continue?')) return;
+    if (draft && !confirm('Starting a new exam discards your unfinished test. Continue?')) return;
     const btn = ev.currentTarget; btn.disabled = true; btn.textContent = 'Building your paper…';
-    try {
-      await startExam(+view.querySelector('input[name=size]:checked').value, view.querySelector('#timed').checked);
-    } catch (e) { toast(errMsg(e), 'bad'); btn.disabled = false; btn.innerHTML = `${icon('exam')}Start mock exam`; }
+    try { const c = choice(); await startExam(c.n, c.timed, c.mpool, pool); }
+    catch (e) { toast(errMsg(e), 'bad'); btn.disabled = false; btn.innerHTML = `${icon('exam')}Start mock exam`; }
   };
 }
 
-async function startExam(n, timed) {
+async function startExam(n, timed, mpool = 'new', pool = null) {
   const meta = await loadMeta();
-  const all = await fetchAll(() => sb.from('questions').select('id,category_id').eq('active', true).order('id'));
-  const byDisc = new Map();
-  for (const q of all) { const t = meta.topicById.get(q.category_id); if (!t) continue; if (!byDisc.has(t.discipline_id)) byDisc.set(t.discipline_id, []); byDisc.get(t.discipline_id).push(q.id); }
-  const discs = meta.disciplines.map((d) => ({ ...d, total: (byDisc.get(d.id) || []).length }));
-  const rows = allocate(n, discs);
-  const ids = shuffle(rows.flatMap((r) => shuffle(byDisc.get(r.d.id) || []).slice(0, r.k)));
-  if (!ids.length) throw new Error('No questions available for a mock exam.');
-  const qs = await inChunks(ids, 100, (chunk) => fetchAll(() => sb.from('questions').select(QCOLS).in('id', chunk).order('id')));
-  const qById = new Map(qs.map((q) => [q.id, q]));
-  const items = ids.map((id) => qById.get(id)).filter(Boolean).map((q) => ({ q, order: optionOrder(q.options), sel: new Set(), flagged: false }));
-  const label = `Mock exam · ${items.length} questions`;
-  const sessionId = check(await sb.rpc('start_session', { p_mode: 'mock', p_label: label, p_total: items.length }));
-  state.exam = { sessionId, label, timed, startedAt: Date.now(), endsAt: timed ? Date.now() + items.length * 60000 : null, i: 0, items };
-  saveDraft();
-  location.hash = '#/exam/run';
+  pool = pool || (await loadPool());
+  const by = poolByDisc(meta, pool);
+  const capped = meta.disciplines.map((d) => ({ ...d, total: mpool === 'incorrect' ? by.get(d.id).incorrect.length : by.get(d.id).all.length }));
+  const rows = allocate(n, capped);
+  const ids = shuffle(rows.flatMap((r) => {
+    const g = by.get(r.d.id);
+    const order = mpool === 'incorrect' ? shuffle(g.incorrect)
+      : mpool === 'any' ? shuffle(g.all)
+      : [...shuffle(g.unused), ...shuffle(g.incorrect), ...shuffle(g.correct)];
+    return order.slice(0, r.k).map((q) => q.id);
+  }));
+  if (!ids.length) throw new Error('No questions available for this mock exam.');
+  const qs = await fetchQuestions(ids);
+  const tag = { new: 'New', incorrect: 'Incorrect', any: 'Any' }[mpool];
+  await startExamWith(qs, { mode: 'mock', label: `Mock exam · ${qs.length} questions · ${tag}`, timed, opts: { mock: true, n, mpool } });
 }
+
+/** Start a block in exam mode: the weighted mock paper, or a custom test from the builder. */
+async function startExamWith(qs, { mode, label, timed, opts = null }) {
+  if (!state.marks) await loadPool();
+  const items = qs.map((q) => ({ q, order: optionOrder(q.options), sel: new Set(), flagged: state.marks.has(q.id) }));
+  const sessionId = check(await sb.rpc('start_session', { p_mode: mode, p_label: label, p_total: items.length }));
+  state.exam = { sessionId, mode, label, opts, timed, startedAt: Date.now(), endsAt: timed ? Date.now() + items.length * 60000 : null, i: 0, items };
+  saveDraft();
+  if (location.hash === '#/exam/run') renderExamRun(); else location.hash = '#/exam/run';
+}
+const examNav = (ex) => (ex && ex.mode !== 'mock' ? 'practice' : 'exam');
 
 function saveDraft() {
   const ex = state.exam; if (!ex || ex.submitted) return;
-  store.set(draftKey(), { sessionId: ex.sessionId, label: ex.label, timed: ex.timed, startedAt: ex.startedAt, endsAt: ex.endsAt, i: ex.i,
+  store.set(draftKey(), { sessionId: ex.sessionId, mode: ex.mode, opts: ex.opts, label: ex.label, timed: ex.timed, startedAt: ex.startedAt, endsAt: ex.endsAt, i: ex.i,
     items: ex.items.map((it) => ({ id: it.q.id, order: it.order, sel: [...it.sel], flagged: it.flagged })) });
 }
 async function restoreDraft() {
   const d = store.get(draftKey()); if (!d) return false;
-  const qs = await inChunks(d.items.map((x) => x.id), 100, (chunk) => fetchAll(() => sb.from('questions').select(QCOLS).in('id', chunk).order('id')));
+  const qs = await fetchQuestions(d.items.map((x) => x.id));
   const qById = new Map(qs.map((q) => [q.id, q]));
   const items = d.items.filter((x) => qById.has(x.id)).map((x) => ({ q: qById.get(x.id), order: x.order, sel: new Set(x.sel), flagged: x.flagged }));
-  state.exam = { ...d, items };
+  state.exam = { mode: 'mock', ...d, items };
+  if (!state.marks) await loadPool();
   return true;
 }
 
@@ -814,7 +954,7 @@ function startTimer() {
 
 async function renderExamRun() {
   if (!state.exam || state.exam.submitted) {
-    shell('exam', loading);
+    shell(examNav(store.get(draftKey())), loading);
     if (!(await restoreDraft())) { location.hash = '#/exam'; return; }
   }
   const ex = state.exam; const meta = await loadMeta();
@@ -823,19 +963,19 @@ async function renderExamRun() {
   const answered = ex.items.filter((x) => x.sel.size).length;
   const topic = meta.topicById.get(q.category_id); const disc = topic && meta.discById.get(topic.discipline_id);
 
-  const view = shell('exam', `
+  const view = shell(examNav(ex), `
     <div class="runner exam">
       <div>
         <div class="run-top"><span class="pos">Question ${ex.i + 1} of ${n}</span><span class="muted small num">${answered} answered</span></div>
         <div class="progress" role="progressbar" aria-valuemin="0" aria-valuemax="${n}" aria-valuenow="${answered}" aria-label="Questions answered"><span style="width:${(100 * answered) / n}%"></span></div>
         <article class="card qcard" aria-labelledby="qtext">
-          <div class="qmeta">${disc ? `<span class="chip pri">${esc(disc.name)}</span>` : ''}<span class="chip">${multi ? 'Multiple answers' : 'Single answer'}</span>${it.flagged ? `<span class="chip warn">${icon('flag')}Flagged</span>` : ''}</div>
+          <div class="qmeta">${disc ? `<span class="chip pri">${esc(disc.name)}</span>` : ''}<span class="chip">${multi ? 'Multiple answers' : 'Single answer'}</span></div>
           <h1 class="qtext" id="qtext">${esc(q.question)}</h1>
           <p class="qhint">${multi ? 'Select all correct answers.' : 'Select one answer.'} You can change it until you submit.</p>
           <div class="options" role="${multi ? 'group' : 'radiogroup'}" aria-labelledby="qtext">${optionButtons(it)}</div>
           <div class="run-actions">
             <button class="btn" id="exPrev" ${ex.i === 0 ? 'disabled' : ''}>${icon('left')}Previous</button>
-            <button class="btn ghost" id="exFlag" aria-pressed="${it.flagged}">${icon('flag')}${it.flagged ? 'Unflag' : 'Flag'}</button>
+            <button class="btn ghost" id="exFlag" aria-pressed="${it.flagged}">${icon('flag')}${it.flagged ? 'Marked' : 'Mark'}</button>
             ${ex.i < n - 1 ? `<button class="btn primary" id="exNext">Next ${icon('right')}</button>` : `<button class="btn primary" id="exSubmit2">Review &amp; submit</button>`}
           </div>
         </article>
@@ -843,8 +983,8 @@ async function renderExamRun() {
       </div>
       <aside class="card side" aria-label="Exam navigator">
         ${ex.timed ? `<div class="timer" id="timer" role="timer" aria-live="off">${icon('clock')}<span>--:--</span></div>` : `<div class="timer">${icon('clock')}<span class="small muted" style="font-weight:500">Untimed</span></div>`}
-        <div class="qgrid" role="list">${ex.items.map((x, k) => `<button role="listitem" data-go="${k}" class="${x.sel.size ? 'answered' : ''} ${x.flagged ? 'flagged' : ''} ${k === ex.i ? 'current' : ''}" aria-label="Question ${k + 1}${x.sel.size ? ', answered' : ''}${x.flagged ? ', flagged' : ''}" ${k === ex.i ? 'aria-current="true"' : ''}>${k + 1}</button>`).join('')}</div>
-        <div class="legend-row"><span><i class="a"></i>Answered</span><span><i></i>Not answered</span><span><i class="f"></i>Flagged</span></div>
+        <div class="qgrid" role="list">${ex.items.map((x, k) => `<button role="listitem" data-go="${k}" class="${x.sel.size ? 'answered' : ''} ${x.flagged ? 'flagged' : ''} ${k === ex.i ? 'current' : ''}" aria-label="Question ${k + 1}${x.sel.size ? ', answered' : ''}${x.flagged ? ', marked' : ''}" ${k === ex.i ? 'aria-current="true"' : ''}>${k + 1}</button>`).join('')}</div>
+        <div class="legend-row"><span><i class="a"></i>Answered</span><span><i></i>Not answered</span><span><i class="f"></i>Marked</span></div>
         <button class="btn primary block" id="exSubmit" style="margin-top:16px">Submit exam</button>
         <p class="muted small" style="margin:8px 0 0">${n - answered} not answered</p>
       </aside>
@@ -860,11 +1000,14 @@ async function renderExamRun() {
   view.querySelectorAll('[data-go]').forEach((b) => (b.onclick = () => go(+b.dataset.go)));
   const prev = view.querySelector('#exPrev'); if (prev) prev.onclick = () => go(ex.i - 1);
   const next = view.querySelector('#exNext'); if (next) next.onclick = () => go(ex.i + 1);
-  view.querySelector('#exFlag').onclick = () => { it.flagged = !it.flagged; saveDraft(); renderExamRun(); };
+  view.querySelector('#exFlag').onclick = () => {
+    it.flagged = !it.flagged; saveDraft(); renderExamRun();
+    if (it.flagged !== !!state.marks?.has(q.id)) toggleMark(q.id);
+  };
   const askSubmit = () => {
     const missing = n - ex.items.filter((x) => x.sel.size).length;
     const flagged = ex.items.filter((x) => x.flagged).length;
-    const msg = `Submit your exam now?${missing ? `\n\n${missing} question${missing > 1 ? 's are' : ' is'} not answered and will count as wrong.` : ''}${flagged ? `\n${flagged} question${flagged > 1 ? 's are' : ' is'} flagged.` : ''}`;
+    const msg = `Submit your exam now?${missing ? `\n\n${missing} question${missing > 1 ? 's are' : ' is'} not answered and will count as wrong.` : ''}${flagged ? `\n${flagged} question${flagged > 1 ? 's are' : ' is'} marked.` : ''}`;
     if (confirm(msg)) submitExam();
   };
   view.querySelector('#exSubmit').onclick = askSubmit;
@@ -877,7 +1020,7 @@ async function submitExam() {
   if (!ex || ex.submitted || ex.submitting) return;
   ex.submitting = true;
   clearInterval(state.timer);
-  const view = shell('exam', `<div class="card empty" role="status">${icon('upload')}<h2>Marking your paper…</h2><p class="muted num" id="saving">Saving answers 0 / ${ex.items.length}</p></div>`);
+  const view = shell(examNav(ex), `<div class="card empty" role="status">${icon('upload')}<h2>Marking your paper…</h2><p class="muted num" id="saving">Saving answers 0 / ${ex.items.length}</p></div>`);
   let done = 0;
   for (let i = 0; i < ex.items.length; i += 8) {
     await Promise.all(ex.items.slice(i, i + 8).map(async (it) => {
@@ -899,7 +1042,8 @@ async function submitExam() {
 async function renderExamResult() {
   const ex = state.examResult;
   if (!ex) { location.hash = '#/exam'; return; }
-  const view = shell('exam', loading);
+  const view = shell(examNav(ex), loading);
+  const isMock = ex.mode === 'mock';
   const [meta, sessions] = await Promise.all([loadMeta(), sessionsFor(state.profile.id)]);
   const n = ex.items.length; const right = ex.items.filter((x) => x.ok).length;
   const score = Math.round((100 * right) / n);
@@ -919,25 +1063,27 @@ async function renderExamResult() {
     <section class="card"><div class="result-head">
       <div class="ring" style="--p:${score};--c:var(${score >= 75 ? '--ok' : score >= 50 ? '--warn' : '--bad'})"><span>${score}%</span></div>
       <div style="flex:1;min-width:240px">
-        <h1>Mock exam result</h1>
-        <p class="muted">${right} of ${n} correct · ${mins} min${prevMock ? ` · previous mock ${pct(prevMock.correct, prevMock.total)}` : ''}</p>
+        <h1>${isMock ? 'Mock exam result' : 'Test result'}</h1>
+        <p class="muted">${right} of ${n} correct · ${mins} min${isMock && prevMock ? ` · previous mock ${pct(prevMock.correct, prevMock.total)}` : ''}${isMock ? '' : ` · ${esc(ex.label)}`}</p>
         ${unsaved ? `<p class="chip bad">${icon('alert')}${unsaved} answers were not saved because of a connection problem.</p>` : ''}
-        <div class="btn-row"><a class="btn primary" href="#/exam">${icon('retry')}New mock exam</a><a class="btn" href="#/progress">${icon('trend')}See progress</a></div>
+        <div class="btn-row">${isMock ? `<a class="btn primary" href="#/exam">${icon('retry')}Next mock exam</a>` : `${ex.opts ? `<button class="btn primary" id="sameAgain">${icon('retry')}New test, same settings</button>` : ''}<a class="btn" href="#/practice">Create another test</a>`}<a class="btn" href="#/progress">${icon('trend')}See progress</a></div>
       </div></div></section>
     <div class="grid two">
       <section class="card" aria-labelledby="rd"><h2 id="rd">By discipline</h2>
         <div class="table-wrap"><table><thead><tr><th>Discipline</th><th class="n">Score</th><th>Result</th></tr></thead><tbody>
         ${[...per.values()].sort((a, b) => (a.d?.sort || 99) - (b.d?.sort || 99)).map((p) => { const a = pctNum(p.ok, p.n); return `<tr><td>${esc(p.d ? p.d.name : 'Other')}</td><td class="n">${p.ok}/${p.n}</td><td><div class="cov"><span class="bar ${barClass(a)}"><span style="width:${a}%"></span></span><small class="acc ${accClass(a)}">${a}%</small></div></td></tr>`; }).join('')}
         </tbody></table></div></section>
-      <section class="card" aria-labelledby="rc"><h2 id="rc">Your mock exam scores</h2><div id="curve"></div></section>
+      <section class="card" aria-labelledby="rc"><h2 id="rc">${isMock ? 'Your mock exam scores' : 'Your scores'}</h2><div id="curve"></div></section>
     </div>
     <section class="card" aria-labelledby="rr">
       <div class="row-between"><h2 id="rr">Review answers</h2>
-        <div class="filters" role="group" aria-label="Filter answers">${[['wrong', 'Wrong'], ['flagged', 'Flagged'], ['all', 'All']].map(([v, l], k) => `<button class="btn sm" data-f="${v}" aria-pressed="${k === 0}">${l}</button>`).join('')}</div></div>
+        <div class="filters" role="group" aria-label="Filter answers">${[['wrong', 'Wrong'], ['flagged', 'Marked'], ['all', 'All']].map(([v, l], k) => `<button class="btn sm" data-f="${v}" aria-pressed="${k === 0}">${l}</button>`).join('')}</div></div>
       <ol class="review" id="rlist"></ol>
     </section>`;
 
-  drawCurveInto(view.querySelector('#curve'), mocks.length ? mocks : sessions, { mockOnly: true, highlight: ex.sessionId });
+  drawCurveInto(view.querySelector('#curve'), isMock ? mocks : sessions, { mockOnly: isMock, highlight: ex.sessionId });
+  const sa = view.querySelector('#sameAgain');
+  if (sa) sa.onclick = async () => { sa.disabled = true; try { if (!(await startTest(ex.opts))) sa.disabled = false; } catch (e) { toast(errMsg(e), 'bad'); sa.disabled = false; } };
   const list = view.querySelector('#rlist');
   const draw = (f) => {
     const items = ex.items.filter((x) => (f === 'wrong' ? !x.ok : f === 'flagged' ? x.flagged : true));
@@ -969,14 +1115,14 @@ function drawCurveInto(box, sessions, { mockOnly = false, highlight = null } = {
   }
   const points = done.map((s, k) => ({ k, s, score: Math.round((100 * s.correct) / s.answered), mock: s.mode === 'mock' }));
   const mocks = points.filter((p) => p.mock); const prac = points.filter((p) => !p.mock);
-  const summary = [trendSentence(mocks, 'Mock exams'), mockOnly ? '' : trendSentence(prac, 'Practice sessions')].filter(Boolean).join(' ');
+  const summary = [trendSentence(mocks, 'Mock exams'), mockOnly ? '' : trendSentence(prac, 'Topic tests')].filter(Boolean).join(' ');
   const table = `<details class="data-table"><summary>Show scores as a table</summary><div class="table-wrap"><table><thead><tr><th>Date</th><th>Session</th><th class="n">Score</th><th class="n">Correct</th></tr></thead><tbody>
-    ${points.slice().reverse().map((p) => `<tr><td>${fmtDate(p.s.started_at)}</td><td>${p.mock ? '<span class="chip pri">Mock exam</span>' : '<span class="chip">Practice</span>'} ${esc(p.s.label || '')}</td><td class="n"><span class="acc ${accClass(p.score)}">${p.score}%</span></td><td class="n">${p.s.correct}/${p.s.answered}</td></tr>`).join('')}
+    ${points.slice().reverse().map((p) => `<tr><td>${fmtDate(p.s.started_at)}</td><td>${p.mock ? '<span class="chip pri">Mock exam</span>' : '<span class="chip">Topic test</span>'} ${esc(p.s.label || '')}</td><td class="n"><span class="acc ${accClass(p.score)}">${p.score}%</span></td><td class="n">${p.s.correct}/${p.s.answered}</td></tr>`).join('')}
     </tbody></table></div></details>`;
 
   if (points.length < 4 || !window.Chart) {
     // Too few points for a meaningful trend line: show them as stat tiles instead.
-    box.innerHTML = `<div class="grid stats">${points.slice(-4).map((p) => `<div class="stat"><span class="label">${p.mock ? 'Mock exam' : 'Practice'} · ${shortDate(p.s.started_at)}</span><span class="value">${p.score}<small>%</small></span><span class="hint">${p.s.correct}/${p.s.answered} correct</span></div>`).join('')}</div>
+    box.innerHTML = `<div class="grid stats">${points.slice(-4).map((p) => `<div class="stat"><span class="label">${p.mock ? 'Mock exam' : 'Topic test'} · ${shortDate(p.s.started_at)}</span><span class="value">${p.score}<small>%</small></span><span class="hint">${p.s.correct}/${p.s.answered} correct</span></div>`).join('')}</div>
       <p class="muted small">${points.length < 4 ? `Complete ${4 - points.length} more session${4 - points.length > 1 ? 's' : ''} to see your improvement curve.` : ''}</p>${table}`;
     return;
   }
@@ -990,7 +1136,7 @@ function drawCurveInto(box, sessions, { mockOnly = false, highlight = null } = {
   const datasets = [];
   if (mocks.length) datasets.push({ label: 'Mock exams', data: points.map((p) => (p.mock ? p.score : null)), borderColor: primary, backgroundColor: primary,
     pointRadius: (c) => (c.dataIndex !== undefined && points[c.dataIndex] && points[c.dataIndex].s.id === highlight ? 7 : 4), pointHoverRadius: 8, pointStyle: 'circle', borderWidth: 2.5, spanGaps: true, tension: 0.25, clip: false });
-  if (prac.length && !mockOnly) datasets.push({ label: 'Practice sessions', data: points.map((p) => (!p.mock ? p.score : null)), borderColor: grey, backgroundColor: grey,
+  if (prac.length && !mockOnly) datasets.push({ label: 'Topic tests', data: points.map((p) => (!p.mock ? p.score : null)), borderColor: grey, backgroundColor: grey,
     borderDash: [6, 4], pointStyle: 'triangle', pointRadius: 4, pointHoverRadius: 7, borderWidth: 2, spanGaps: true, tension: 0.25, clip: false });
   new window.Chart(box.querySelector('canvas'), {
     type: 'line',
@@ -1006,7 +1152,7 @@ function drawCurveInto(box, sessions, { mockOnly = false, highlight = null } = {
         legend: { position: 'top', align: 'start', labels: { color: muted, usePointStyle: true, boxWidth: 8, boxHeight: 8 } },
         tooltip: { callbacks: {
           title: (items) => fmtDate(points[items[0].dataIndex].s.started_at),
-          label: (c) => { const p = points[c.dataIndex]; return `${p.mock ? 'Mock exam' : 'Practice'}: ${c.parsed.y}% (${p.s.correct}/${p.s.answered})`; },
+          label: (c) => { const p = points[c.dataIndex]; return `${p.mock ? 'Mock exam' : 'Topic test'}: ${c.parsed.y}% (${p.s.correct}/${p.s.answered})`; },
           afterLabel: (c) => points[c.dataIndex].s.label || '',
         } },
       },
@@ -1019,8 +1165,11 @@ function drawCurveInto(box, sessions, { mockOnly = false, highlight = null } = {
    ========================================================================= */
 
 async function progressHTML(userId) {
-  const [meta, stats, sessions] = await Promise.all([loadMeta(), topicStats(userId), sessionsFor(userId)]);
+  const [meta, stats, sessions, pool] = await Promise.all([loadMeta(), topicStats(userId), sessionsFor(userId), loadPool(userId)]);
   const r = readiness(meta, stats);
+  const wrongBy = new Map(); const markedBy = new Map();
+  for (const q of pool) { if (q.status === 'incorrect') wrongBy.set(q.cat, (wrongBy.get(q.cat) || 0) + 1); if (q.marked) markedBy.set(q.cat, (markedBy.get(q.cat) || 0) + 1); }
+  const nWrong = sum([...wrongBy.values()]); const nMarked = sum([...markedBy.values()]);
   const overall = rollUp([...stats.values()]);
   const totalQs = sum(meta.disciplines.map((d) => d.total));
   const mocks = sessions.filter((s) => s.mode === 'mock');
@@ -1028,11 +1177,11 @@ async function progressHTML(userId) {
   const html = `
     <div class="grid stats">
       <div class="stat"><span class="label">${icon('target')}Estimated exam score</span><span class="value">${r.score === null ? '–' : r.score + '<small>%</small>'}</span><span class="hint">${r.score === null ? 'Not enough answers yet' : `Covers ${r.weightCovered}% of the exam weight`}</span></div>
-      <div class="stat"><span class="label">${icon('layers')}Questions practised</span><span class="value">${overall.answered.toLocaleString()}<small>/${totalQs.toLocaleString()}</small></span><span class="hint">${pct(overall.answered, totalQs)} of the bank</span></div>
-      <div class="stat"><span class="label">${icon('check')}Accuracy</span><span class="value">${pct(overall.correct, overall.attempts)}</span><span class="hint">${overall.due} due for review</span></div>
+      <div class="stat"><span class="label">${icon('layers')}Questions used</span><span class="value">${overall.answered.toLocaleString()}<small>/${totalQs.toLocaleString()}</small></span><span class="hint">${pct(overall.answered, totalQs)} of the bank</span></div>
+      <div class="stat"><span class="label">${icon('check')}Accuracy</span><span class="value">${pct(overall.correct, overall.attempts)}</span><span class="hint">${nWrong.toLocaleString()} incorrect · ${nMarked.toLocaleString()} marked</span></div>
       <div class="stat"><span class="label">${icon('exam')}Mock exams</span><span class="value">${mocks.length}</span><span class="hint">${best === null ? 'None yet' : `Best ${best}% · latest ${pct(mocks[mocks.length - 1].correct, mocks[mocks.length - 1].answered)}`}</span></div>
     </div>
-    <section class="card" aria-labelledby="pc"><h2 id="pc">Improvement curve</h2><p class="muted small">Every finished session, oldest to newest. Mock exams are the solid line; topic practice is dashed.</p><div id="curve"></div></section>
+    <section class="card" aria-labelledby="pc"><h2 id="pc">Improvement curve</h2><p class="muted small">Every finished session, oldest to newest. Weighted mock exams are the solid line; topic tests (tutor and exam mode) are dashed.</p><div id="curve"></div></section>
     <section class="card" aria-labelledby="pd"><h2 id="pd">Readiness by discipline</h2>
       <p class="muted small">Accuracy per discipline, with its weight in the exam. The estimated score weights these the same way the real paper does.</p>
       <div class="table-wrap"><table><thead><tr><th>Discipline</th><th class="n">Weight</th><th>Coverage</th><th class="n">Accuracy</th><th>Last practised</th></tr></thead><tbody>
@@ -1041,21 +1190,88 @@ async function progressHTML(userId) {
         <td class="n"><span class="acc ${accClass(p.acc)}">${p.acc === null ? '–' : p.acc + '%'}</span></td><td>${fmtDate(p.s.last)}</td></tr>`).join('')}
       </tbody></table></div></section>
     <section class="card" aria-labelledby="ptp"><h2 id="ptp">By topic</h2>
-      <div class="table-wrap"><table><thead><tr><th>Topic</th><th>Coverage</th><th class="n">Accuracy</th><th class="n">Due</th></tr></thead><tbody>
-      ${meta.disciplines.filter((d) => d.total).map((d) => `<tr class="group"><td colspan="4">${esc(d.name)}</td></tr>` + d.topics.filter((t) => meta.totals.get(t.id)).map((t) => {
+      <div class="table-wrap"><table><thead><tr><th>Topic</th><th>Coverage</th><th class="n">Accuracy</th><th class="n">Incorrect</th><th class="n">Marked</th></tr></thead><tbody>
+      ${meta.disciplines.filter((d) => d.total).map((d) => `<tr class="group"><td colspan="5">${esc(d.name)}</td></tr>` + d.topics.filter((t) => meta.totals.get(t.id)).map((t) => {
         const s = stats.get(t.id); const total = meta.totals.get(t.id); const a = s ? pctNum(s.correct, s.attempts) : null;
         return `<tr><td>${esc(t.name)}</td><td><div class="cov"><span class="bar"><span style="width:${s ? Math.round((100 * s.answered) / total) : 0}%"></span></span><small>${s ? s.answered : 0}/${total}</small></div></td>
-          <td class="n"><span class="acc ${accClass(a)}">${a === null ? '–' : a + '%'}</span></td><td class="n">${s ? s.due : 0}</td></tr>`;
+          <td class="n"><span class="acc ${accClass(a)}">${a === null ? '–' : a + '%'}</span></td><td class="n">${wrongBy.get(t.id) || 0}</td><td class="n">${markedBy.get(t.id) || 0}</td></tr>`;
       }).join('')).join('')}
       </tbody></table></div></section>`;
-  return { html, sessions };
+  return { html, sessions, meta, pool };
 }
 
 async function renderMyProgress() {
   const view = shell('progress', loading);
-  const { html, sessions } = await progressHTML(state.profile.id);
-  view.innerHTML = `<div class="page-head"><div><h1>Progress</h1><p class="muted">How your scores are moving, and where to focus next.</p></div></div>` + html;
+  const { html, sessions, meta, pool } = await progressHTML(state.profile.id);
+  view.innerHTML = `<div class="page-head"><div><h1>Progress</h1><p class="muted">How your scores are moving, and where to focus next.</p></div></div>` + html + ankiCardHTML(meta, pool);
   drawCurveInto(view.querySelector('#curve'), sessions);
+  wireAnki(view, meta, pool);
+}
+
+
+/* =========================================================================
+   Anki export (incorrect / marked questions as an Anki import file)
+   ========================================================================= */
+
+function ankiFile(meta, qs, deck) {
+  const field = (v) => '"' + String(v).replace(/"/g, '""').replace(/\t/g, ' ').replace(/\r?\n/g, '<br>') + '"';
+  const tagify = (v) => String(v).trim().replace(/\s+/g, '_').replace(/"/g, '');
+  const lines = ['#separator:tab', '#html:true', '#notetype:Basic', `#deck:${deck}`, '#tags column:3'];
+  for (const q of qs) {
+    const t = meta.topicById.get(q.category_id); const d = t && meta.discById.get(t.discipline_id);
+    const multi = q.qtype === 'CM' || q.correct.length > 1;
+    const opts = q.options.map((o, i) => `${LETTERS[i]}. ${esc(o)}`).join('<br>');
+    const front = `${esc(q.question)}<br><br>${opts}<br><br><i>${multi ? 'Multiple answers (CM)' : 'Single answer (CS)'}</i>`;
+    const back = `<b>Answer: ${q.correct.map((c) => LETTERS[c]).join(', ')}</b><br>${q.correct.map((c) => `${LETTERS[c]}. ${esc(q.options[c])}`).join('<br>')}`
+      + (q.explanation ? `<br><br>${esc(q.explanation)}` : '') + `<br><br><small>${esc(d ? d.name : '')}${t && d && t.name !== d.name ? ' › ' + esc(t.name) : ''}</small>`;
+    const tags = ['USMF', d ? `USMF::${tagify(d.name)}${t && t.name !== d.name ? '::' + tagify(t.name) : ''}` : ''].filter(Boolean).join(' ');
+    lines.push([field(front), field(back), field(tags)].join('\t'));
+  }
+  return lines.join('\n') + '\n';
+}
+
+function ankiCardHTML(meta, pool) {
+  const discs = meta.disciplines.filter((d) => d.total);
+  const nW = pool.filter((q) => q.status === 'incorrect').length; const nM = pool.filter((q) => q.marked).length;
+  return `<section class="card" aria-labelledby="ak"><h2 id="ak">Export to Anki</h2>
+    <p class="muted small">Download your incorrect and marked questions as an Anki file (in Anki: File → Import). Cards show the question with its options on the front and the official key on the back, tagged by discipline and topic.</p>
+    <div class="choices">
+      <label class="choice"><input type="checkbox" name="ankiPool" value="incorrect" checked><span><b>Incorrect <span class="count num">(${nW})</span></b><small>Wrong the last time you answered</small></span></label>
+      <label class="choice"><input type="checkbox" name="ankiPool" value="marked" ${nM ? 'checked' : ''}><span><b>Marked <span class="count num">(${nM})</span></b><small>Questions you flagged</small></span></label>
+    </div>
+    <div class="row">
+      <label class="field" style="margin:0;min-width:220px"><span class="sr">Discipline</span><select id="ankiDisc"><option value="">All disciplines</option>${discs.map((d) => `<option value="${d.id}">${esc(d.name)}</option>`).join('')}</select></label>
+      <button class="btn primary" id="ankiBtn">${icon('download')}Download for Anki</button>
+      <span class="muted small" id="ankiInfo" aria-live="polite"></span>
+    </div></section>`;
+}
+
+function wireAnki(view, meta, pool) {
+  const btn = view.querySelector('#ankiBtn'); if (!btn) return;
+  const pick = () => {
+    const pools = [...view.querySelectorAll('input[name=ankiPool]:checked')].map((b) => b.value);
+    const disc = +view.querySelector('#ankiDisc').value || null;
+    const hits = pool.filter((q) => (pools.includes(q.status) || (q.marked && pools.includes('marked')))
+      && (!disc || meta.topicById.get(q.cat)?.discipline_id === disc));
+    return { pools, disc, hits };
+  };
+  const sync = () => { const { hits } = pick(); view.querySelector('#ankiInfo').textContent = `${hits.length} card${hits.length === 1 ? '' : 's'}`; btn.disabled = !hits.length; };
+  view.querySelectorAll('input[name=ankiPool], #ankiDisc').forEach((el) => el.addEventListener('change', sync));
+  sync();
+  btn.onclick = async () => {
+    const { pools, disc, hits } = pick();
+    btn.disabled = true; btn.textContent = 'Preparing…';
+    try {
+      const qs = await fetchQuestions(hits.map((q) => q.id));
+      const what = pools.map((p) => (p === 'incorrect' ? 'Incorrect' : 'Marked')).join(' + ');
+      const dname = disc ? meta.discById.get(disc).name : '';
+      const deck = `USMF Exam Prep::${what}${dname ? '::' + dname.replace(/::/g, ' ') : ''}`;
+      const stamp = new Date().toISOString().slice(0, 10);
+      download(`usmf-anki-${what.toLowerCase().replace(/\W+/g, '-')}${dname ? '-' + dname.toLowerCase().replace(/\W+/g, '-') : ''}-${stamp}.txt`, ankiFile(meta, qs, deck), 'text/plain;charset=utf-8');
+      toast(`Exported ${qs.length} cards for Anki.`, 'ok');
+    } catch (e) { toast(errMsg(e), 'bad'); }
+    finally { btn.innerHTML = `${icon('download')}Download for Anki`; sync(); }
+  };
 }
 
 /* =========================================================================
@@ -1206,11 +1422,12 @@ async function renderAdminLearner(id) {
   const ta = view.querySelector('#toggleActive'); if (ta) ta.onclick = () => update({ active: !p.active }, p.active ? 'Account disabled.' : 'Account re-enabled.');
   const tr = view.querySelector('#toggleRole'); if (tr) tr.onclick = () => { if (confirm(p.role === 'admin' ? 'Remove admin rights?' : 'Give this person full admin rights?')) update({ role: p.role === 'admin' ? 'learner' : 'admin' }, 'Role updated.'); };
   view.querySelector('#reset').onclick = async () => {
-    if (!confirm(`Delete all practice history, mock exams and the improvement curve for ${p.full_name || p.email}? This can't be undone.`)) return;
+    if (!confirm(`Delete all practice history, marked questions, mock exams and the improvement curve for ${p.full_name || p.email}? This can't be undone.`)) return;
     try {
       check(await sb.from('answers').delete().eq('user_id', id));
       check(await sb.from('sessions').delete().eq('user_id', id));
       check(await sb.from('progress').delete().eq('user_id', id));
+      check(await sb.from('marks').delete().eq('user_id', id));
       toast('Progress reset.', 'ok'); renderAdminLearner(id);
     } catch (e) { toast(errMsg(e), 'bad'); }
   };

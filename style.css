@@ -353,3 +353,11 @@ details.data-table summary { cursor: pointer; color: var(--primary); font-weight
 .toast.bad { background: var(--bad); color: #fff; }
 .toast.out { opacity: 0; transform: translateY(6px); }
 @media (prefers-color-scheme: dark) { .toast.ok, .toast.bad { color: #0a1517; } }
+
+/* Test builder & marks */
+.choices.four { grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); }
+.choice .count { font-weight: 500; color: var(--muted); }
+.qmeta .mark-btn { margin-left: auto; min-height: 32px; padding: 4px 10px; }
+.qmeta .mark-btn[aria-pressed="true"], #exFlag[aria-pressed="true"] { color: var(--warn); }
+.pool-links { display: flex; flex-wrap: wrap; gap: var(--space-2); margin-top: var(--space-4); }
+.choices.one { grid-template-columns: 1fr; }

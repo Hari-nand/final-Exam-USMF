@@ -8,19 +8,28 @@ A practice site for the USMF graduation exam tests. The admin creates learner ac
 ## What it does
 
 **Learners**
-- **Home:** estimated exam score, latest mock exam, accuracy, weakest topics with a one-click drill, and the improvement curve.
-- **Practice:** pick whole disciplines or single topics, then a mode:
-  - **Smart review:** questions due for review plus new ones first. A correct answer comes back after 1, 3, 7, 14, then 30 days; a wrong one comes back straight away.
-  - **Random:** shuffled questions from the selection.
-  - **My mistakes:** only questions answered wrongly last time.
+- **Home:** estimated exam score, latest mock exam, accuracy, counts of unused / incorrect / marked questions (one click opens a test from that pool), weakest topics with a one-click drill, and the improvement curve.
+- **Create a test** (UWorld-style):
+  - **Mode:** *Tutor* (answer and key shown after each question) or *Exam* (answer the whole block, optionally timed at 1 minute per question, then score and review).
+  - **Question pool:** Unused, Incorrect (wrong the last time), Marked, Correct — any combination, with live counts.
+  - **Question type:** single answer (CS), multiple answers (CM) or both.
+  - **Subjects:** whole disciplines or single topics; each shows how many questions match the filters.
+  - **Number of questions:** any number up to what's available.
+
+  A CM answer counts only if it matches the key exactly, like the real exam; tutor feedback still shows which options were right, wrong or missed.
+- **Mock exam:** 50, 100, 150 or 200 questions split across disciplines by the exam weights.
+  - *New questions first* (default): only questions you have never answered. When a discipline runs out of new ones, it repeats your incorrect ones from that discipline first. The page shows how many more all-new papers you have left.
+  - *Incorrect only*: the second round, still weighted.
+  - *Any questions*: random from the whole bank.
   
-  Single-answer (CS) questions are checked as soon as an option is picked. Multiple-answer (CM) questions are checked after the learner selects options and presses **Check answer**. Like the real exam, a CM answer counts only if it matches the key exactly; the feedback still shows which options were right, wrong or missed.
-- **Mock exam:** 50, 100, 150 or 200 questions drawn at random from the whole bank, split across disciplines by the exam weights (largest-remainder rounding). Optional timer of one minute per question, a question navigator, flags, and answers that survive a page reload. Answers are revealed after submitting, with a score per discipline and a filterable review.
-- **Progress:** improvement curve (mock exams solid, topic practice dashed, with a table version), estimated exam score weighted by the blueprint, readiness per discipline and coverage/accuracy per topic.
-- Keyboard: A–E or 1–5 to answer, Enter to check / go on; in a mock exam ← → to move and F to flag.
+  Questions left blank when a paper is submitted count as incorrect.
+- **Mark** any question (button or M key) in tutor or exam mode; marks are saved and form their own pool.
+- **Progress:** improvement curve (weighted mocks solid, topic tests dashed, with a table version), estimated exam score, readiness per discipline, and per topic: coverage, accuracy, incorrect and marked counts.
+- **Export to Anki** (Progress page): incorrect and/or marked questions, all or one discipline, as a file Anki imports directly (File → Import). Front: question and options; back: the official key; tagged `USMF::Discipline::Topic`.
+- Keyboard: A–F or 1–6 to answer, Enter to check / go on, M to mark; in exam mode ← → to move.
 
 **Admin**
-- **Learners:** add a learner (name, email, temporary password) and copy the sign-in details to send. Open a learner to see their full progress and curve, rename them, set a password, disable or re-enable, change role, or reset progress.
+- **Learners:** add a learner (name, email, temporary password) and copy the sign-in details to send. Open a learner to see their full progress and curve, rename them, set a password, disable or re-enable, change role, or reset progress (answers, sessions and marks).
 - **Questions & blueprint:** edit the discipline weights, bulk-import the question bank from JSON, browse by discipline and topic, edit questions (several correct answers allowed), hide or delete questions, and export everything to JSON.
 
 ## Exam blueprint
@@ -81,6 +90,7 @@ A JSON list. Disciplines and topics that don't exist yet are created automatical
 | `sample-questions.json` | Example questions for import |
 | `supabase/schema.sql` | Base tables, security rules and functions (applied) |
 | `supabase/migration_002_exam.sql` | Disciplines, multiple-answer questions, sessions and answer history (applied) |
+| `supabase/migration_003_marks.sql` | Marked questions (applied) |
 | `supabase/functions/admin-users/index.ts` | Server function for creating accounts and setting passwords (deployed) |
 
 ## Good to know
