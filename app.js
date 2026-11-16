@@ -172,10 +172,13 @@ async function claimSession() {
 }
 
 /** Check this device's session (and record activity). Signs out with a reason if it has ended. */
-async function heartbeat(touch = false) {
-  if (SEC.enabled === false || !state.profile || SEC.leaving) return true;
+async function heartbeat(touch = false, force = false) {
+  if (!state.profile || SEC.leaving) return true;
+  // Security not in the database yet: look again every 5 minutes (or when a save fails),
+  // so open tabs pick it up as soon as it's switched on.
+  if (SEC.enabled === false && !force && Date.now() - SEC.lastBeat < 300000) return true;
   const { data, error } = await sb.rpc('session_heartbeat', { p_touch: touch });
-  if (error) { if (missingInDb(error)) SEC.enabled = false; else console.warn(error); return true; } // network blip: keep going
+  if (error) { if (missingInDb(error)) { SEC.enabled = false; SEC.lastBeat = Date.now(); } else console.warn(error); return true; } // network blip: keep going
   SEC.lastBeat = Date.now();
   applySec(data);
   if (data.state === 'ok' || data.state === 'exempt') return true;
@@ -337,7 +340,7 @@ const routes = {
 let lastRoute = '';
 async function router() {
   if (!state.profile) return renderLogin();
-  if (SEC.enabled !== false && Date.now() - SEC.lastBeat > 30000 && !(await heartbeat(SEC.lastActivity > SEC.lastBeat))) return;
+  if (Date.now() - SEC.lastBeat > 30000 && !(await heartbeat(SEC.lastActivity > SEC.lastBeat, true))) return;
   const parts = location.hash.replace(/^#\/?/, '').split('/').filter(Boolean);
   let route = parts[0] || 'home';
   let param;
@@ -776,7 +779,7 @@ function renderSession() {
   const save = async () => {
     const { data, error } = await sb.rpc('record_answer', { p_question_id: q.id, p_selected: [...it.sel], p_session_id: run.sessionId });
     it.saved = !error;
-    if (error) { console.error(error); heartbeat(false); }
+    if (error) { console.error(error); heartbeat(false, true); }
     if (!error && data !== it.ok) console.warn('Server and client disagree on correctness', q.id);
     if (state.run === run && run.items[run.i] === it) showSaveState();
   };
@@ -1140,7 +1143,7 @@ async function submitExam() {
     }));
     const el = view.querySelector('#saving'); if (el) el.textContent = `Saving answers ${done} / ${ex.items.length}`;
   }
-  if (ex.items.some((x) => x.saved === false) && !(await heartbeat(false))) return;
+  if (ex.items.some((x) => x.saved === false) && !(await heartbeat(false, true))) return;
   await sb.rpc('finish_session', { p_session_id: ex.sessionId }).then(() => {}, () => {});
   ex.submitted = true; ex.finishedAt = Date.now();
   store.del(draftKey());
