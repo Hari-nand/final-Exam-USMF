@@ -292,6 +292,68 @@ async function sessionsFor(userId) {
 }
 
 /* =========================================================================
+   Security notice: everyone accepts it once (again if NOTICE_VERSION goes up)
+   ========================================================================= */
+
+const NOTICE_VERSION = 1;
+const NOTICE_DATE = '16 November 2026';
+const NOTICE_ISSUER = 'ANYMS';
+const needsNotice = () => !!state.profile && 'notice_version' in state.profile && (state.profile.notice_version || 0) < NOTICE_VERSION;
+
+function noticeItems(r) {
+  const items = [
+    ['user', 'Your account is personal', 'Do not share your email or password, and do not let anyone else use your account.'],
+  ];
+  if (r.one_device) items.push(['shield', 'One device at a time', 'Signing in on another device signs you out everywhere else.']);
+  if (r.idle_minutes || r.max_session_hours) items.push(['clock', 'Automatic sign-out', [
+    r.idle_minutes ? `You are signed out after ${r.idle_minutes} minutes without activity.` : '',
+    r.max_session_hours ? `You need to sign in again every ${r.max_session_hours} hours.` : '',
+    'Unfinished mock exams are kept.'].filter(Boolean).join(' ')]);
+  if (r.country_lock_hours) items.push(['alert', 'Location check', `A sign-in from a different country within ${r.country_lock_hours} hours of your last sign-in is blocked. If you travel, ask the admin to allow it.`]);
+  items.push(
+    ['eye', 'What is recorded', 'For each sign-in we record the time, your device and browser, your approximate country and your IP address. This is used only to protect accounts, is visible only to the admin, and is deleted after 180 days. Your answers and progress are also visible to the admin.'],
+    ['x', 'If an account is shared', 'Accounts that show signs of sharing may be signed out or deactivated.'],
+    ['book', 'Question content', 'The questions are for your personal study. Do not copy, sell or redistribute them.'],
+  );
+  return items;
+}
+
+async function renderNotice() {
+  const { data } = await sb.rpc('security_summary');
+  const r = data || { one_device: true, idle_minutes: SEC.idle, max_session_hours: SEC.max, country_lock_hours: 0 };
+  const first = (state.profile.full_name || '').split(' ')[0];
+  $app.innerHTML = `
+    <main class="auth-wrap" id="view" tabindex="-1">
+      <form class="card notice" id="noticeForm" aria-labelledby="nt" novalidate>
+        <div class="brand"><span class="mark">${icon('shield')}</span>${esc(APP_NAME)}</div>
+        <h1 id="nt">Account security notice</h1>
+        <p class="muted">${first ? `${esc(first)}, we` : 'We'} have added protections to keep accounts secure. Please read them and accept once to continue.</p>
+        <ol class="notice-list">${noticeItems(r).map(([ic, t, d]) => `<li>${icon(ic)}<div><b>${t}</b><p>${esc(d)}</p></div></li>`).join('')}</ol>
+        <p class="signed"><span>Issued by <b>${esc(NOTICE_ISSUER)}</b></span><span>Version ${NOTICE_VERSION} · ${NOTICE_DATE}</span></p>
+        <label class="choice"><input type="checkbox" id="agree"><span><b>I have read and accept this notice</b><small>Your acceptance is recorded with the date and time.</small></span></label>
+        <div class="btn-row">
+          <button class="btn primary lg" type="submit" id="acceptBtn" disabled>Accept and continue ${icon('right')}</button>
+          <button class="btn ghost" type="button" id="noticeOut">${icon('logout')}Sign out</button>
+        </div>
+        <p class="form-error" id="noticeErr" role="alert"></p>
+      </form>
+    </main>`;
+  const f = document.getElementById('noticeForm'); const agree = f.querySelector('#agree'); const btn = f.querySelector('#acceptBtn');
+  agree.onchange = () => { btn.disabled = !agree.checked; };
+  f.querySelector('#noticeOut').onclick = () => signOutNow();
+  document.getElementById('view').focus({ preventScroll: true });
+  f.onsubmit = async (ev) => {
+    ev.preventDefault();
+    if (!agree.checked) return;
+    btn.disabled = true; btn.textContent = 'Saving…';
+    const { error } = await sb.rpc('accept_notice', { p_version: NOTICE_VERSION, p_device: deviceLabel() });
+    if (error) { f.querySelector('#noticeErr').textContent = errMsg(error); btn.disabled = false; btn.innerHTML = `Accept and continue ${icon('right')}`; return; }
+    state.profile.notice_version = NOTICE_VERSION; state.profile.notice_accepted_at = new Date().toISOString();
+    if (!location.hash || location.hash === '#/login') location.hash = '#/home'; else router();
+  };
+}
+
+/* =========================================================================
    Shell & router
    ========================================================================= */
 
@@ -341,6 +403,7 @@ let lastRoute = '';
 async function router() {
   if (!state.profile) return renderLogin();
   if (Date.now() - SEC.lastBeat > 30000 && !(await heartbeat(SEC.lastActivity > SEC.lastBeat, true))) return;
+  if (needsNotice()) return renderNotice();
   const parts = location.hash.replace(/^#\/?/, '').split('/').filter(Boolean);
   let route = parts[0] || 'home';
   let param;
@@ -1578,7 +1641,7 @@ async function renderAdminLearners() {
           <td>${fmtDate(last)}</td>${events ? (() => {
             const mine = events.filter((e) => e.user_id === p.id); const lastIn = mine.find((e) => e.event === 'login'); const fl = sharingFlags(mine);
             return `<td>${lastIn ? `${esc(lastIn.device || '')}${lastIn.country ? ' · ' + esc(lastIn.country) : ''}<br><span class="muted small">${fmtDate(lastIn.at)}</span>` : '<span class="muted">–</span>'}${fl.length ? `<br><span class="chip bad" title="${esc(fl.join(' · '))}">${icon('alert')}Possible sharing</span>` : ''}</td>`;
-          })() : ''}<td>${p.active ? '<span class="chip ok">Active</span>' : '<span class="chip">Disabled</span>'}</td></tr>`;
+          })() : ''}<td>${p.active ? '<span class="chip ok">Active</span>' : '<span class="chip">Disabled</span>'}${'notice_version' in p && p.notice_version < NOTICE_VERSION ? '<br><span class="chip warn">Notice not accepted</span>' : ''}</td></tr>`;
       }).join('')}</tbody></table></div></section>`;
 
   const form = view.querySelector('#addForm');
@@ -1634,6 +1697,7 @@ async function renderAdminLearner(id) {
     ${events ? `<section class="card" aria-labelledby="sis"><div class="row-between"><h2 id="sis">Sign-in security</h2>
         <div class="btn-row">${lockOn && !self ? `<button class="btn sm" id="allowLoc" ${allowed ? 'disabled' : ''}>${allowed ? `New country allowed until ${new Date(p.location_ok_until).toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' })}` : 'Allow a new country for 24 h'}</button>` : ''}
         ${self ? '' : '<button class="btn sm" id="signOutAll">Sign out of all devices</button>'}</div></div>
+      ${'notice_version' in p ? `<p class="small">${p.notice_version >= NOTICE_VERSION ? `${icon('check')} Accepted the security notice (version ${p.notice_version}) ${fmtDate(p.notice_accepted_at)}.` : `${icon('alert')} Has not accepted the security notice yet. They will be asked at their next sign-in.`}</p>` : ''}
       ${flags.length ? `<p class="chip bad">${icon('alert')}Possible sharing in the last 7 days: ${esc(flags.join(' · '))}</p>` : '<p class="muted small">No signs of account sharing in the last 7 days.</p>'}
       ${eventsTable(events.slice(0, 30))}</section>` : ''}`;
   drawCurveInto(view.querySelector('#curve'), sessions);

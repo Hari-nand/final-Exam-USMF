@@ -83,6 +83,7 @@ Enforced by the database, not just the app, so it can't be bypassed from the bro
 - **New-country block.** A sign-in from a different country within 12 hours of the last one is refused and logged. The admin can allow a new country for 24 hours from the learner's page. Countries come from Cloudflare's `cf-ipcountry` header; the Security page says whether detection is working.
 - **Sign-in history** with time, device, country and IP address, kept 180 days. Learners are flagged for **possible sharing** after repeated device take-overs, sign-ins from several countries or many devices, or a blocked sign-in.
 - **Sign out of all devices** for any learner, and disabling an account signs it out everywhere.
+- **Security notice, issued by ANYMS.** Everyone sees it at their next sign-in and must tick "I have read and accept" before continuing. Each acceptance is recorded (version, time, device, country, IP). The learners list shows who hasn't accepted. To ask everyone again after changing the wording, raise `NOTICE_VERSION` in `app.js`.
 - All rules can be changed or switched off on the Security page. Admins are exempt by default so you can't lock yourself out.
 
 ## How it's secured
@@ -102,7 +103,8 @@ Enforced by the database, not just the app, so it can't be bypassed from the bro
 | `supabase/schema.sql` | Base tables, security rules and functions (applied) |
 | `supabase/migration_002_exam.sql` | Disciplines, multiple-answer questions, sessions and answer history (applied) |
 | `supabase/migration_003_marks.sql` | Marked questions (applied) |
-| `supabase/migration_004_security.sql` | Sign-in rules: one device, timeouts, new-country block, sign-in history |
+| `supabase/migration_004_security.sql` | Sign-in rules: one device, timeouts, new-country block, sign-in history (applied) |
+| `supabase/migration_005_notice.sql` | Security notice acceptance (applied) |
 | `supabase/functions/admin-users/index.ts` | Server function for creating accounts and setting passwords (deployed) |
 
 ## Good to know
