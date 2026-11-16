@@ -124,12 +124,114 @@ async function loadProfile() {
   const { data: { session } } = await sb.auth.getSession();
   if (!session) { state.profile = null; return null; }
   const profile = check(await sb.from('profiles').select('*').eq('id', session.user.id).maybeSingle());
-  const refuse = async (msg) => { state.flash = msg; await sb.auth.signOut(); throw new Error(msg); };
+  const refuse = async (msg) => { state.flash = msg; SEC.leaving = true; await sb.auth.signOut({ scope: 'local' }); throw new Error(msg); };
   if (!profile) await refuse('No profile found for this account. Ask your admin to add you.');
   if (!profile.active) await refuse('This account has been deactivated. Contact your admin.');
   state.profile = profile;
   return profile;
 }
+
+/* =========================================================================
+   Session security: one device at a time, idle timeout, session length,
+   new-country block. Enforced in the database (migration 004); the app
+   registers each sign-in, sends a heartbeat, and explains sign-outs.
+   ========================================================================= */
+
+const SEC = { enabled: null, exempt: false, idle: 0, max: 0, lastActivity: Date.now(), lastBeat: 0, beatTimer: null, idleTimer: null, warnEl: null, leaving: false };
+
+function deviceLabel() {
+  const ua = navigator.userAgent;
+  const os = /Windows/.test(ua) ? 'Windows' : /Android/.test(ua) ? 'Android' : /iPhone|iPad|iPod/.test(ua) ? 'iOS' : /Mac OS X/.test(ua) ? 'macOS' : /CrOS/.test(ua) ? 'ChromeOS' : /Linux/.test(ua) ? 'Linux' : 'unknown OS';
+  const br = /Edg\//.test(ua) ? 'Edge' : /OPR\//.test(ua) ? 'Opera' : /SamsungBrowser/.test(ua) ? 'Samsung Internet' : /CriOS|Chrome\//.test(ua) ? 'Chrome' : /FxiOS|Firefox\//.test(ua) ? 'Firefox' : /Safari\//.test(ua) ? 'Safari' : 'Browser';
+  return `${br} on ${os}`;
+}
+const missingInDb = (e) => !!e && (e.code === 'PGRST202' || e.code === 'PGRST205' || e.code === '42P01' || /Could not find the (function|table)/i.test(e.message || ''));
+
+function secMessage(r) {
+  switch (r.reason || r.state) {
+    case 'replaced': return 'You were signed out because your account was signed in on another device. Each account can be used on one device at a time.';
+    case 'admin': return 'Your admin signed you out of all devices.';
+    case 'idle': return `You were signed out after ${r.idle_minutes || SEC.idle} minutes without activity.`;
+    case 'expired': return `For security, a sign-in lasts ${r.max_session_hours || SEC.max} hours. Please sign in again.`;
+    case 'location': return `This sign-in was blocked because your account was used from another country${r.previous ? ` (${r.previous})` : ''} in the last ${r.hours} hours. If this was you, ask your admin to allow it.`;
+    default: return 'Your session has ended. Please sign in again.';
+  }
+}
+function applySec(d) {
+  if (!d) return;
+  SEC.enabled = true; SEC.idle = d.idle_minutes || 0; SEC.max = d.max_session_hours || 0;
+  if (d.state) SEC.exempt = d.state === 'exempt';
+}
+
+/** Register this sign-in with the database. Returns { ok, reason, ... }. */
+async function claimSession() {
+  const { data, error } = await sb.rpc('claim_session', { p_device: deviceLabel() });
+  if (error) { if (missingInDb(error)) { SEC.enabled = false; return { ok: true }; } throw error; }
+  applySec(data); SEC.lastBeat = Date.now();
+  return data;
+}
+
+/** Check this device's session (and record activity). Signs out with a reason if it has ended. */
+async function heartbeat(touch = false) {
+  if (SEC.enabled === false || !state.profile || SEC.leaving) return true;
+  const { data, error } = await sb.rpc('session_heartbeat', { p_touch: touch });
+  if (error) { if (missingInDb(error)) SEC.enabled = false; else console.warn(error); return true; } // network blip: keep going
+  SEC.lastBeat = Date.now();
+  applySec(data);
+  if (data.state === 'ok' || data.state === 'exempt') return true;
+  if (data.state === 'none') {
+    const r = await claimSession().catch(() => ({ ok: true }));
+    if (r.ok) return true;
+    await forceSignOut(secMessage(r)); return false;
+  }
+  await forceSignOut(secMessage(data));
+  return false;
+}
+
+async function forceSignOut(msg) {
+  if (SEC.leaving) return;
+  SEC.leaving = true; state.flash = msg;
+  stopSecurityTimers();
+  await sb.auth.signOut({ scope: 'local' });
+  state.profile = null; // covers page start, before the sign-out listener is attached
+}
+async function signOutNow() {
+  SEC.leaving = true;
+  if (SEC.enabled) await sb.rpc('end_my_session').then(() => {}, () => {});
+  await sb.auth.signOut({ scope: 'local' });
+}
+
+function startSecurityTimers() {
+  stopSecurityTimers();
+  SEC.leaving = false; SEC.lastActivity = Date.now();
+  SEC.beatTimer = setInterval(() => { if (!document.hidden) heartbeat(SEC.lastActivity > SEC.lastBeat); }, 60000);
+  SEC.idleTimer = setInterval(checkIdle, 10000);
+}
+function stopSecurityTimers() { clearInterval(SEC.beatTimer); clearInterval(SEC.idleTimer); hideIdleWarning(); }
+
+function checkIdle() {
+  if (!SEC.enabled || SEC.exempt || !SEC.idle || !state.profile || SEC.leaving) return;
+  const idleMs = Date.now() - SEC.lastActivity; const limit = SEC.idle * 60000;
+  if (idleMs >= limit) { forceSignOut(secMessage({ reason: 'idle' })); return; }
+  if (idleMs >= limit - 60000) showIdleWarning(Math.ceil((limit - idleMs) / 1000));
+}
+function showIdleWarning(secs) {
+  if (!SEC.warnEl) {
+    SEC.warnEl = document.createElement('div');
+    SEC.warnEl.className = 'idle-warn'; SEC.warnEl.setAttribute('role', 'alertdialog'); SEC.warnEl.setAttribute('aria-live', 'assertive');
+    SEC.warnEl.innerHTML = `${icon('clock')}<span></span><button class="btn primary sm" type="button">Stay signed in</button>`;
+    SEC.warnEl.querySelector('button').onclick = () => { SEC.lastActivity = Date.now(); hideIdleWarning(); heartbeat(true); };
+    document.body.appendChild(SEC.warnEl);
+  }
+  SEC.warnEl.querySelector('span').textContent = `You'll be signed out in about ${secs} seconds because there's been no activity.`;
+}
+function hideIdleWarning() { if (SEC.warnEl) { SEC.warnEl.remove(); SEC.warnEl = null; } }
+
+['pointerdown', 'keydown', 'wheel', 'touchstart'].forEach((ev) => window.addEventListener(ev, (e) => {
+  SEC.lastActivity = Date.now();
+  if (SEC.warnEl && !SEC.warnEl.contains(e.target)) hideIdleWarning();
+}, { passive: true, capture: true }));
+document.addEventListener('visibilitychange', () => { if (!document.hidden && state.profile) { checkIdle(); heartbeat(false); } });
 
 /** Disciplines, topics and question counts (cached until something changes). */
 async function loadMeta(force = false) {
@@ -213,7 +315,7 @@ function shell(active, inner) {
     </header>
     <main id="view" tabindex="-1">${inner}</main>
     <nav class="bottom-nav" aria-label="Main">${items.map(link).join('')}</nav>`;
-  document.getElementById('signOut').onclick = () => sb.auth.signOut();
+  document.getElementById('signOut').onclick = () => signOutNow();
   return document.getElementById('view');
 }
 
@@ -229,11 +331,13 @@ const routes = {
   'admin/learners': renderAdminLearners,
   'admin/learner': renderAdminLearner,
   'admin/questions': renderAdminQuestions,
+  'admin/security': renderAdminSecurity,
 };
 
 let lastRoute = '';
 async function router() {
   if (!state.profile) return renderLogin();
+  if (SEC.enabled !== false && Date.now() - SEC.lastBeat > 30000 && !(await heartbeat(SEC.lastActivity > SEC.lastBeat))) return;
   const parts = location.hash.replace(/^#\/?/, '').split('/').filter(Boolean);
   let route = parts[0] || 'home';
   let param;
@@ -289,6 +393,7 @@ function renderLogin() {
     const fd = new FormData(form);
     if (!fd.get('email') || !fd.get('password')) { errEl.textContent = 'Enter your email and password.'; return; }
     btn.disabled = true; btn.textContent = 'Signing in…'; errEl.textContent = '';
+    SEC.leaving = false;
     const { error } = await sb.auth.signInWithPassword({ email: String(fd.get('email')).trim(), password: fd.get('password') });
     if (error) {
       errEl.textContent = error.message === 'Invalid login credentials' ? 'Wrong email or password. Check them and try again.' : error.message;
@@ -297,6 +402,9 @@ function renderLogin() {
     }
     try {
       await loadProfile();
+      const r = await claimSession();
+      if (!r.ok) { await forceSignOut(secMessage(r)); return; }
+      startSecurityTimers();
       if (!location.hash || location.hash === '#/login') location.hash = '#/home'; else router();
     } catch (e) {
       errEl.textContent = errMsg(e);
@@ -668,7 +776,7 @@ function renderSession() {
   const save = async () => {
     const { data, error } = await sb.rpc('record_answer', { p_question_id: q.id, p_selected: [...it.sel], p_session_id: run.sessionId });
     it.saved = !error;
-    if (error) console.error(error);
+    if (error) { console.error(error); heartbeat(false); }
     if (!error && data !== it.ok) console.warn('Server and client disagree on correctness', q.id);
     if (state.run === run && run.items[run.i] === it) showSaveState();
   };
@@ -1032,6 +1140,7 @@ async function submitExam() {
     }));
     const el = view.querySelector('#saving'); if (el) el.textContent = `Saving answers ${done} / ${ex.items.length}`;
   }
+  if (ex.items.some((x) => x.saved === false) && !(await heartbeat(false))) return;
   await sb.rpc('finish_session', { p_session_id: ex.sessionId }).then(() => {}, () => {});
   ex.submitted = true; ex.finishedAt = Date.now();
   store.del(draftKey());
@@ -1322,14 +1431,118 @@ async function adminAction(body) {
 }
 const adminTabs = (active) => `<nav class="tabs" aria-label="Admin sections">
   <a href="#/admin/learners" ${active === 'learners' ? 'aria-current="page"' : ''}>${icon('user')}Learners</a>
-  <a href="#/admin/questions" ${active === 'questions' ? 'aria-current="page"' : ''}>${icon('layers')}Questions &amp; blueprint</a></nav>`;
+  <a href="#/admin/questions" ${active === 'questions' ? 'aria-current="page"' : ''}>${icon('layers')}Questions &amp; blueprint</a>
+  <a href="#/admin/security" ${active === 'security' ? 'aria-current="page"' : ''}>${icon('shield')}Security</a></nav>`;
+
+/* ---------- Admin: security ---------- */
+
+const EVENT_LABEL = { login: 'Signed in', replaced_other: 'Other device signed out', blocked_location: 'Blocked: new country', admin_signout: 'Signed out by admin' };
+
+/** Returns null when migration 004 isn't in the database yet. */
+async function loadLoginEvents(days = 30, userId = null) {
+  const since = new Date(Date.now() - days * 86400000).toISOString();
+  let q = sb.from('login_events').select('user_id,at,event,device,ip,country,detail').gte('at', since).order('at', { ascending: false }).limit(1000);
+  if (userId) q = q.eq('user_id', userId);
+  const { data, error } = await q;
+  if (error) { if (missingInDb(error)) return null; throw error; }
+  return data;
+}
+
+/** Signs that an account may be shared, from the last 7 days of sign-ins. */
+function sharingFlags(events) {
+  const week = Date.now() - 7 * 86400000;
+  const ev = events.filter((e) => new Date(e.at).getTime() >= week);
+  const out = [];
+  const switches = ev.filter((e) => e.event === 'replaced_other').length;
+  const countries = [...new Set(ev.filter((e) => e.event === 'login' && e.country).map((e) => e.country))];
+  const devices = [...new Set(ev.filter((e) => e.event === 'login' && e.device).map((e) => e.device))];
+  const ips = [...new Set(ev.filter((e) => e.event === 'login' && e.ip).map((e) => e.ip))];
+  const blocked = ev.filter((e) => e.event === 'blocked_location').length;
+  if (switches >= 3) out.push(`${switches} device take-overs`);
+  if (countries.length >= 2) out.push(`signed in from ${countries.join(', ')}`);
+  if (blocked) out.push(`${blocked} blocked sign-in${blocked > 1 ? 's' : ''} from a new country`);
+  if (devices.length >= 3) out.push(`${devices.length} different devices`);
+  if (ips.length >= 6) out.push(`${ips.length} different networks`);
+  return out;
+}
+
+function eventsTable(events, names = null) {
+  if (!events.length) return '<p class="muted">No sign-ins recorded yet.</p>';
+  return `<div class="table-wrap"><table><thead><tr><th>When</th>${names ? '<th>Learner</th>' : ''}<th>Event</th><th>Device</th><th>Country</th><th>IP address</th></tr></thead><tbody>
+    ${events.map((e) => `<tr><td>${fmtDate(e.at)}</td>${names ? `<td>${esc(names.get(e.user_id) || '–')}</td>` : ''}
+      <td>${e.event === 'login' ? EVENT_LABEL.login : `<span class="chip ${e.event === 'blocked_location' ? 'bad' : 'warn'}">${esc(EVENT_LABEL[e.event] || e.event)}</span>`}${e.detail ? `<br><span class="muted small">${esc(e.detail)}</span>` : ''}</td>
+      <td>${esc(e.device || '–')}</td><td>${esc(e.country || '–')}</td><td class="num">${esc(e.ip || '–')}</td></tr>`).join('')}
+    </tbody></table></div>`;
+}
+
+const notEnabledCard = () => `<section class="card"><h2>${icon('shield')} Security isn't switched on yet</h2>
+  <p class="muted">The security rules need a one-time database update. Run <code>supabase/migration_004_security.sql</code> from the repository in the Supabase SQL Editor, then reload this page.</p></section>`;
+
+async function renderAdminSecurity() {
+  const view = shell('admin', loading);
+  const settingsRes = await sb.from('security_settings').select('*').maybeSingle();
+  if (settingsRes.error && missingInDb(settingsRes.error)) { view.innerHTML = adminTabs('security') + notEnabledCard(); return; }
+  const c = check(settingsRes);
+  const [profiles, events, active] = await Promise.all([
+    sb.from('profiles').select('id,full_name,email,role').then(check),
+    loadLoginEvents(30),
+    sb.from('user_sessions').select('session_id,user_id,device,ip,country,started_at,last_seen').is('ended_at', null).order('last_seen', { ascending: false }).then(check),
+  ]);
+  const names = new Map(profiles.map((p) => [p.id, p.full_name || p.email]));
+  const freshCut = Date.now() - Math.max(c.idle_minutes || 60, 5) * 60000;
+  const online = active.filter((s) => new Date(s.last_seen).getTime() > freshCut);
+  const seenCountries = [...new Set(events.filter((e) => e.country).map((e) => e.country))];
+  const opt = (vals, cur, unit) => vals.map((v) => `<option value="${v}" ${v === cur ? 'selected' : ''}>${v === 0 ? 'Off' : `${v} ${unit}${v === 1 ? '' : 's'}`}</option>`).join('');
+  const flagged = profiles.map((p) => ({ p, f: sharingFlags(events.filter((e) => e.user_id === p.id)) })).filter((x) => x.f.length);
+
+  view.innerHTML = `${adminTabs('security')}
+    <h1>Security</h1>
+    <div class="grid two">
+      <form class="card" id="secForm">
+        <h2>Sign-in rules</h2>
+        <label class="choice"><input type="checkbox" name="one_device" ${c.one_device ? 'checked' : ''}><span><b>One device at a time</b><small>Signing in on a new device signs the old one out straight away.</small></span></label>
+        <label class="field">Sign out after no activity for<select name="idle_minutes">${opt([0, 15, 30, 60, 120, 240], c.idle_minutes, 'minute')}</select><span class="help">A warning appears a minute before.</span></label>
+        <label class="field">Maximum length of a sign-in<select name="max_session_hours">${opt([0, 4, 8, 12, 24, 72, 168], c.max_session_hours, 'hour')}</select><span class="help">After this, the learner has to sign in again even if active.</span></label>
+        <label class="field">Block sign-in from a different country within<select name="country_lock_hours">${opt([0, 6, 12, 24, 48, 168], c.country_lock_hours, 'hour')}</select>
+          <span class="help">${seenCountries.length ? `Country detection is working (seen: ${esc(seenCountries.join(', '))}).` : 'The country is shown here after the next sign-in. If it never appears, this rule has no effect.'}</span></label>
+        <label class="choice"><input type="checkbox" name="admins_exempt" ${c.admins_exempt ? 'checked' : ''}><span><b>Admins are exempt</b><small>Recommended, so you can't lock yourself out.</small></span></label>
+        <div class="row-between" style="margin-top:12px"><span class="muted small">Last changed ${fmtDate(c.updated_at)}</span><button class="btn primary">Save rules</button></div>
+      </form>
+      <section class="card">
+        <h2>Possible account sharing <span class="muted small">(last 7 days)</span></h2>
+        ${flagged.length ? `<ul class="flags">${flagged.map((x) => `<li><a href="#/admin/learner/${x.p.id}">${esc(x.p.full_name || x.p.email)}</a><br><span class="muted small">${esc(x.f.join(' · '))}</span></li>`).join('')}</ul>`
+          : '<p class="muted">Nothing unusual. Learners are flagged here after repeated device take-overs, sign-ins from several countries or many devices, or blocked sign-ins.</p>'}
+        <h2 style="margin-top:24px">Signed in now</h2>
+        ${online.length ? `<div class="table-wrap"><table><thead><tr><th>Learner</th><th>Device</th><th>Country</th><th>Last active</th><th></th></tr></thead><tbody>
+          ${online.map((s) => `<tr><td>${esc(names.get(s.user_id) || '–')}</td><td>${esc(s.device || '–')}</td><td>${esc(s.country || '–')}</td><td>${fmtDate(s.last_seen)}</td>
+            <td class="n">${s.user_id === state.profile.id ? '' : `<button class="btn sm" data-out="${s.user_id}">Sign out</button>`}</td></tr>`).join('')}</tbody></table></div>`
+          : '<p class="muted">Nobody right now.</p>'}
+      </section>
+    </div>
+    <section class="card"><h2>Sign-in activity <span class="muted small">(last 30 days)</span></h2>${eventsTable(events.slice(0, 100), names)}</section>`;
+
+  const f = view.querySelector('#secForm');
+  f.onsubmit = async (ev) => {
+    ev.preventDefault();
+    const patch = { one_device: f.one_device.checked, idle_minutes: +f.idle_minutes.value, max_session_hours: +f.max_session_hours.value,
+      country_lock_hours: +f.country_lock_hours.value, admins_exempt: f.admins_exempt.checked, updated_at: new Date().toISOString() };
+    if (!patch.admins_exempt && !confirm('Admins will follow the same rules, including timeouts. Continue?')) return;
+    try { check(await sb.from('security_settings').update(patch).eq('id', true)); toast('Rules saved. They apply to everyone straight away.', 'ok'); await heartbeat(false); renderAdminSecurity(); }
+    catch (e) { toast(errMsg(e), 'bad'); }
+  };
+  view.querySelectorAll('[data-out]').forEach((b) => (b.onclick = async () => {
+    if (!confirm(`Sign ${names.get(b.dataset.out)} out of every device now?`)) return;
+    try { check(await sb.rpc('admin_sign_out_user', { p_user: b.dataset.out })); toast('Signed out.', 'ok'); renderAdminSecurity(); } catch (e) { toast(errMsg(e), 'bad'); }
+  }));
+}
 
 async function renderAdminLearners() {
   const view = shell('admin', loading);
-  const [profiles, stats, sessions] = await Promise.all([
+  const [profiles, stats, sessions, events] = await Promise.all([
     sb.from('profiles').select('*').order('created_at').then(check),
     sb.rpc('progress_stats').then(check),
     fetchAll(() => sb.from('sessions').select('user_id,mode,answered,correct,total,started_at').gt('answered', 0).order('started_at')),
+    loadLoginEvents(7),
   ]);
   const byUser = new Map();
   for (const r of stats) { if (!byUser.has(r.user_id)) byUser.set(r.user_id, []); byUser.get(r.user_id).push(r); }
@@ -1351,7 +1564,7 @@ async function renderAdminLearners() {
     </form>
     <div id="created"></div>
     <section class="card"><div class="table-wrap"><table>
-      <thead><tr><th>Name</th><th>Email</th><th class="n">Practised</th><th class="n">Accuracy</th><th class="n">Mock exams</th><th class="n">Latest mock</th><th>Last active</th><th>Status</th></tr></thead>
+      <thead><tr><th>Name</th><th>Email</th><th class="n">Practised</th><th class="n">Accuracy</th><th class="n">Mock exams</th><th class="n">Latest mock</th><th>Last active</th>${events ? '<th>Last sign-in</th>' : ''}<th>Status</th></tr></thead>
       <tbody>${profiles.map((p) => {
         const s = rollUp(byUser.get(p.id) || []); const ss = sessByUser.get(p.id) || []; const mocks = ss.filter((x) => x.mode === 'mock');
         const last = ss.length ? ss[ss.length - 1].started_at : s.last;
@@ -1359,7 +1572,10 @@ async function renderAdminLearners() {
           <td><a href="#/admin/learner/${p.id}">${esc(p.full_name || '–')}</a>${p.role === 'admin' ? ' <span class="chip pri">admin</span>' : ''}</td>
           <td>${esc(p.email)}</td><td class="n">${s.answered}</td><td class="n">${pct(s.correct, s.attempts)}</td><td class="n">${mocks.length}</td>
           <td class="n">${mocks.length ? pct(mocks[mocks.length - 1].correct, mocks[mocks.length - 1].answered) : '–'}</td>
-          <td>${fmtDate(last)}</td><td>${p.active ? '<span class="chip ok">Active</span>' : '<span class="chip">Disabled</span>'}</td></tr>`;
+          <td>${fmtDate(last)}</td>${events ? (() => {
+            const mine = events.filter((e) => e.user_id === p.id); const lastIn = mine.find((e) => e.event === 'login'); const fl = sharingFlags(mine);
+            return `<td>${lastIn ? `${esc(lastIn.device || '')}${lastIn.country ? ' · ' + esc(lastIn.country) : ''}<br><span class="muted small">${fmtDate(lastIn.at)}</span>` : '<span class="muted">–</span>'}${fl.length ? `<br><span class="chip bad" title="${esc(fl.join(' · '))}">${icon('alert')}Possible sharing</span>` : ''}</td>`;
+          })() : ''}<td>${p.active ? '<span class="chip ok">Active</span>' : '<span class="chip">Disabled</span>'}</td></tr>`;
       }).join('')}</tbody></table></div></section>`;
 
   const form = view.querySelector('#addForm');
@@ -1394,7 +1610,11 @@ async function renderAdminLearner(id) {
   const p = check(await sb.from('profiles').select('*').eq('id', id).maybeSingle());
   if (!p) { view.innerHTML = `${adminTabs('learners')}<div class="card empty"><p>Learner not found.</p><a class="btn" href="#/admin/learners">Back</a></div>`; return; }
   const self = p.id === state.profile.id;
-  const { html, sessions } = await progressHTML(id);
+  const [{ html, sessions }, events, secSettings] = await Promise.all([progressHTML(id), loadLoginEvents(30, id),
+    sb.from('security_settings').select('country_lock_hours').maybeSingle().then((r) => r.data, () => null)]);
+  const flags = events ? sharingFlags(events) : [];
+  const lockOn = secSettings && secSettings.country_lock_hours > 0;
+  const allowed = p.location_ok_until && new Date(p.location_ok_until) > new Date();
   view.innerHTML = `${adminTabs('learners')}
     <a class="btn ghost sm" href="#/admin/learners">${icon('left')}All learners</a>
     <div class="page-head"><div><h1>${esc(p.full_name || p.email)}</h1><p class="muted">${esc(p.email)} · ${p.role === 'admin' ? 'Admin' : 'Learner'} · ${p.active ? 'Active' : 'Disabled'} · added ${fmtDate(p.created_at, false)}</p></div></div>
@@ -1407,8 +1627,22 @@ async function renderAdminLearner(id) {
       <div class="btn-row" style="margin-top:20px;padding-top:16px;border-top:1px solid var(--line)">
         ${self ? '' : `<button class="btn" id="toggleActive">${p.active ? 'Disable account' : 'Re-enable account'}</button><button class="btn" id="toggleRole">${p.role === 'admin' ? 'Make learner' : 'Make admin'}</button>`}
         <button class="btn danger" id="reset">Reset all progress</button>
-      </div></section>`;
+      </div></section>
+    ${events ? `<section class="card" aria-labelledby="sis"><div class="row-between"><h2 id="sis">Sign-in security</h2>
+        <div class="btn-row">${lockOn && !self ? `<button class="btn sm" id="allowLoc" ${allowed ? 'disabled' : ''}>${allowed ? `New country allowed until ${new Date(p.location_ok_until).toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' })}` : 'Allow a new country for 24 h'}</button>` : ''}
+        ${self ? '' : '<button class="btn sm" id="signOutAll">Sign out of all devices</button>'}</div></div>
+      ${flags.length ? `<p class="chip bad">${icon('alert')}Possible sharing in the last 7 days: ${esc(flags.join(' · '))}</p>` : '<p class="muted small">No signs of account sharing in the last 7 days.</p>'}
+      ${eventsTable(events.slice(0, 30))}</section>` : ''}`;
   drawCurveInto(view.querySelector('#curve'), sessions);
+  const so = view.querySelector('#signOutAll');
+  if (so) so.onclick = async () => {
+    if (!confirm(`Sign ${p.full_name || p.email} out of every device now?`)) return;
+    try { check(await sb.rpc('admin_sign_out_user', { p_user: id })); toast('Signed out of all devices.', 'ok'); renderAdminLearner(id); } catch (e) { toast(errMsg(e), 'bad'); }
+  };
+  const al = view.querySelector('#allowLoc');
+  if (al) al.onclick = async () => {
+    try { check(await sb.from('profiles').update({ location_ok_until: new Date(Date.now() + 86400000).toISOString() }).eq('id', id)); toast('They can sign in from a new country for the next 24 hours.', 'ok'); renderAdminLearner(id); } catch (e) { toast(errMsg(e), 'bad'); }
+  };
 
   const update = async (patch, msg) => { try { check(await sb.from('profiles').update(patch).eq('id', id)); toast(msg, 'ok'); renderAdminLearner(id); } catch (e) { toast(errMsg(e), 'bad'); } };
   view.querySelector('#nameForm').onsubmit = (ev) => { ev.preventDefault(); update({ full_name: ev.target.full_name.value.trim() || null }, 'Name saved.'); };
@@ -1419,7 +1653,10 @@ async function renderAdminLearner(id) {
     try { await adminAction({ action: 'set_password', user_id: id, password: pw }); } catch (e) { toast(errMsg(e), 'bad'); return; }
     try { await navigator.clipboard.writeText(pw); toast('Password set and copied to clipboard.', 'ok'); } catch { toast('Password set. Copy it from the box before leaving.', 'ok'); }
   };
-  const ta = view.querySelector('#toggleActive'); if (ta) ta.onclick = () => update({ active: !p.active }, p.active ? 'Account disabled.' : 'Account re-enabled.');
+  const ta = view.querySelector('#toggleActive'); if (ta) ta.onclick = async () => {
+    if (p.active && events) await sb.rpc('admin_sign_out_user', { p_user: id }).then(() => {}, () => {});
+    update({ active: !p.active }, p.active ? 'Account disabled and signed out.' : 'Account re-enabled.');
+  };
   const tr = view.querySelector('#toggleRole'); if (tr) tr.onclick = () => { if (confirm(p.role === 'admin' ? 'Remove admin rights?' : 'Give this person full admin rights?')) update({ role: p.role === 'admin' ? 'learner' : 'admin' }, 'Role updated.'); };
   view.querySelector('#reset').onclick = async () => {
     if (!confirm(`Delete all practice history, marked questions, mock exams and the improvement curve for ${p.full_name || p.email}? This can't be undone.`)) return;
@@ -1693,9 +1930,14 @@ async function renderAdminQuestions() {
     $app.innerHTML = '<main class="auth-wrap"><div class="card auth"><h1>Almost there</h1><p>Add your Supabase URL and publishable key to <code>config.js</code>.</p></div></main>';
     return;
   }
-  try { await loadProfile(); } catch (e) { state.flash = errMsg(e); }
+  try {
+    await loadProfile();
+    if (state.profile && (await heartbeat(false))) startSecurityTimers();
+  } catch (e) { state.flash = state.flash || errMsg(e); }
   sb.auth.onAuthStateChange((event) => {
     if (event === 'SIGNED_OUT') {
+      if (!SEC.leaving && !state.flash) state.flash = 'You were signed out. This happens when your account is signed in on another device or your session ends.';
+      stopSecurityTimers();
       clearInterval(state.timer);
       Object.assign(state, { profile: null, meta: null, run: null, exam: null, examResult: null });
       document.getElementById('toasts').replaceChildren();

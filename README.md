@@ -74,6 +74,17 @@ A JSON list. Disciplines and topics that don't exist yet are created automatical
 - Options containing "All of the above" or "None of the above" keep their order. Other options are shuffled per learner, and the key follows the shuffle.
 - `sample-questions.json` is a two-question example. The full bank is kept out of this public repository.
 
+## Account security (admin → Security)
+
+Enforced by the database, not just the app, so it can't be bypassed from the browser.
+
+- **One device at a time.** Signing in on a new device signs the old one out within a minute, with a message saying why. An older sign-in can't take the account back.
+- **Idle timeout** (default 30 minutes, warning 1 minute before) and **maximum sign-in length** (default 12 hours).
+- **New-country block.** A sign-in from a different country within 12 hours of the last one is refused and logged. The admin can allow a new country for 24 hours from the learner's page. Countries come from Cloudflare's `cf-ipcountry` header; the Security page says whether detection is working.
+- **Sign-in history** with time, device, country and IP address, kept 180 days. Learners are flagged for **possible sharing** after repeated device take-overs, sign-ins from several countries or many devices, or a blocked sign-in.
+- **Sign out of all devices** for any learner, and disabling an account signs it out everywhere.
+- All rules can be changed or switched off on the Security page. Admins are exempt by default so you can't lock yourself out.
+
 ## How it's secured
 
 - **No public sign-up.** Accounts can only be created by the admin. The database rejects any other sign-up, even one sent directly to Supabase.
@@ -91,6 +102,7 @@ A JSON list. Disciplines and topics that don't exist yet are created automatical
 | `supabase/schema.sql` | Base tables, security rules and functions (applied) |
 | `supabase/migration_002_exam.sql` | Disciplines, multiple-answer questions, sessions and answer history (applied) |
 | `supabase/migration_003_marks.sql` | Marked questions (applied) |
+| `supabase/migration_004_security.sql` | Sign-in rules: one device, timeouts, new-country block, sign-in history |
 | `supabase/functions/admin-users/index.ts` | Server function for creating accounts and setting passwords (deployed) |
 
 ## Good to know

@@ -361,3 +361,11 @@ details.data-table summary { cursor: pointer; color: var(--primary); font-weight
 .qmeta .mark-btn[aria-pressed="true"], #exFlag[aria-pressed="true"] { color: var(--warn); }
 .pool-links { display: flex; flex-wrap: wrap; gap: var(--space-2); margin-top: var(--space-4); }
 .choices.one { grid-template-columns: 1fr; }
+
+/* Security */
+.idle-warn { position: fixed; left: 50%; bottom: 88px; transform: translateX(-50%); z-index: 60; display: flex; align-items: center; gap: var(--space-3);
+  max-width: calc(100% - 32px); padding: 12px 16px; background: var(--surface); color: var(--text); border: 1px solid var(--warn); border-radius: var(--radius); box-shadow: var(--shadow-lg, 0 10px 30px rgba(0,0,0,.15)); }
+.idle-warn svg.i { color: var(--warn); flex: none; }
+@media (min-width: 861px) { .idle-warn { bottom: 24px; } }
+ul.flags { list-style: none; padding: 0; margin: 0; display: grid; gap: var(--space-3); }
+ul.flags li { padding: 10px 12px; border: 1px solid var(--line); border-left: 3px solid var(--bad); border-radius: var(--radius-sm, 8px); }
