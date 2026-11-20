@@ -380,3 +380,31 @@ ul.flags li { padding: 10px 12px; border: 1px solid var(--line); border-left: 3p
 .notice .signed { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 4px 16px; padding-top: var(--space-3); border-top: 1px solid var(--line); color: var(--muted); }
 .notice .signed b { color: var(--text); letter-spacing: .04em; }
 .notice .btn-row { margin-top: var(--space-4); }
+
+/* What's new card on Home */
+.card.update { border-color: var(--primary); border-left-width: 4px; }
+.card.update h2 { display: flex; align-items: center; gap: 8px; font-size: 1.15rem; }
+.card.update h2 svg.i { color: var(--primary); }
+.card.update .notice-list { margin: var(--space-3) 0; }
+.card.update .row-between:last-child { margin-bottom: 0; padding-top: var(--space-3); border-top: 1px solid var(--line); }
+
+/* Report a question */
+.report-btn[aria-pressed="true"] { color: var(--warn); }
+.qmeta .report-btn { min-height: 32px; padding: 4px 10px; }
+.qmeta .mark-btn + .report-btn { margin-left: 0; }
+.modal-back { position: fixed; inset: 0; z-index: calc(var(--z-toast) - 1); background: rgba(10, 21, 23, .55); display: flex; align-items: center; justify-content: center; padding: var(--space-4); }
+.modal { width: 100%; max-width: 520px; margin: 0; max-height: calc(100vh - 32px); overflow: auto; }
+.modal h2 { display: flex; align-items: center; gap: 8px; margin-top: 0; }
+.modal h2 svg.i { color: var(--warn); }
+.rq-quote { margin: var(--space-3) 0; padding: var(--space-3); border-left: 3px solid var(--line-strong); background: var(--surface-2); border-radius: var(--radius-sm); font-size: .9375rem; }
+.modal textarea { width: 100%; }
+.nav a, .bottom-nav a { position: relative; }
+.nbadge { display: inline-flex; align-items: center; justify-content: center; min-width: 20px; height: 20px; padding: 0 6px; border-radius: 10px; background: var(--bad); color: #fff; font-size: .75rem; font-weight: 700; line-height: 1; }
+.bottom-nav .nbadge { position: absolute; top: 4px; left: calc(50% + 6px); }
+.tbadge:empty { display: none; }
+.tbadge { display: inline-flex; align-items: center; justify-content: center; min-width: 20px; height: 20px; padding: 0 6px; border-radius: 10px; background: var(--bad); color: #fff; font-size: .75rem; font-weight: 700; }
+.rlist { list-style: none; padding: 0; margin: var(--space-4) 0 0; }
+.reps { list-style: none; padding: 0; margin: 0; display: grid; gap: var(--space-2); }
+.rep { border: 1px solid var(--line); border-radius: var(--radius-sm); padding: var(--space-3); background: var(--surface-2); }
+.rep-comment { margin: var(--space-2) 0; white-space: pre-wrap; overflow-wrap: anywhere; }
+.seg { display: inline-flex; gap: var(--space-1); flex-wrap: wrap; }

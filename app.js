@@ -366,7 +366,7 @@ const NAV = [
 function shell(active, inner) {
   const p = state.profile;
   const items = NAV.concat(p.role === 'admin' ? [['admin', '#/admin/learners', 'Admin', 'shield']] : []);
-  const link = ([key, href, label, ic]) => `<a href="${href}" ${active === key ? 'aria-current="page"' : ''}>${icon(ic)}<span>${label}</span></a>`;
+  const link = ([key, href, label, ic]) => `<a href="${href}" data-nav="${key}" ${active === key ? 'aria-current="page"' : ''}>${icon(ic)}<span>${label}</span></a>`;
   $app.innerHTML = `
     <header class="top">
       <div class="top-inner">
@@ -381,6 +381,7 @@ function shell(active, inner) {
     <main id="view" tabindex="-1">${inner}</main>
     <nav class="bottom-nav" aria-label="Main">${items.map(link).join('')}</nav>`;
   document.getElementById('signOut').onclick = () => signOutNow();
+  if (p.role === 'admin') paintReportBadge();
   return document.getElementById('view');
 }
 
@@ -397,6 +398,7 @@ const routes = {
   'admin/learner': renderAdminLearner,
   'admin/questions': renderAdminQuestions,
   'admin/security': renderAdminSecurity,
+  'admin/reports': renderAdminReports,
 };
 
 let lastRoute = '';
@@ -483,9 +485,40 @@ function renderLogin() {
    Home dashboard
    ========================================================================= */
 
+/* ---------------------------------------------------------------
+   Notices from the database (table "announcements"): each shows on Home
+   between show_from and show_until, once per user until they tap "Got it"
+---------------------------------------------------------------- */
+async function loadAnnouncements() {
+  const { data, error } = await sb.from('announcements').select('id,title,intro,items,issuer,show_from,show_until').order('show_from', { ascending: false });
+  if (error) { if (!missingInDb(error)) console.warn(error); return []; }
+  const now = Date.now();
+  return (data || []).filter((a) => Date.parse(a.show_from) <= now && (!a.show_until || Date.parse(a.show_until) > now));
+}
+const longDate = (ts) => new Date(ts).toLocaleDateString('en-GB', { day: 'numeric', month: 'long', year: 'numeric' });
+const updatesKey = () => 'mcq-updates-seen:' + (state.profile ? state.profile.id : '');
+function updateCards(list) {
+  const seen = store.get(updatesKey()) || [];
+  return list.filter((u) => !seen.includes(u.id)).map((u) => `
+    <section class="card update" data-update="${esc(u.id)}" aria-labelledby="up-${esc(u.id)}">
+      <div class="row-between"><h2 id="up-${esc(u.id)}">${icon('shield')}${esc(u.title)}</h2><span class="muted small">${esc(longDate(u.show_from))}</span></div>
+      ${u.intro ? `<p class="muted">${esc(u.intro)}</p>` : ''}
+      <ul class="notice-list">${(Array.isArray(u.items) ? u.items : []).map(([ic, t, d]) => `<li>${icon(ICONS[ic] ? ic : 'check')}<div><b>${esc(t)}</b><p>${esc(d)}</p></div></li>`).join('')}</ul>
+      <div class="row-between"><span class="muted small">Issued by <b>${esc(u.issuer)}</b></span><button class="btn primary sm" type="button" data-dismiss-update="${esc(u.id)}">Got it</button></div>
+    </section>`).join('');
+}
+function wireUpdates(root) {
+  root.querySelectorAll('[data-dismiss-update]').forEach((b) => (b.onclick = () => {
+    const seen = store.get(updatesKey()) || [];
+    if (!seen.includes(b.dataset.dismissUpdate)) seen.push(b.dataset.dismissUpdate);
+    store.set(updatesKey(), seen);
+    b.closest('.update')?.remove();
+  }));
+}
+
 async function renderHome() {
   const view = shell('home', loading);
-  const [meta, stats, sessions, pool] = await Promise.all([loadMeta(), topicStats(state.profile.id), sessionsFor(state.profile.id), loadPool()]);
+  const [meta, stats, sessions, pool, notices, nReports] = await Promise.all([loadMeta(), topicStats(state.profile.id), sessionsFor(state.profile.id), loadPool(), loadAnnouncements(), state.profile.role === 'admin' ? openReportCount(true) : 0]);
   const totalQs = sum(meta.disciplines.map((d) => d.total));
   const nUnused = pool.filter((q) => q.status === 'unused').length;
   const nWrong = pool.filter((q) => q.status === 'incorrect').length;
@@ -513,6 +546,8 @@ async function renderHome() {
 
     ${draft ? `<div class="card tight row-between" style="border-color:var(--warn)"><div class="row">${icon('clock')}<div><b>You have an unfinished test.</b><br><span class="muted small">${esc(draft.label || '')}</span></div></div>
       <a class="btn primary" href="#/exam/run">Resume exam</a></div>` : ''}
+
+    ${nReports ? reportsHomeCard(nReports) : ''}${updateCards(notices)}
 
     <div class="grid stats">
       <div class="stat"><span class="label">${icon('target')}Estimated exam score</span><span class="value">${r.score === null ? '–' : r.score + '<small>%</small>'}</span>
@@ -552,6 +587,7 @@ async function renderHome() {
     </section>`;
 
   drawCurveInto(view.querySelector('#curve'), sessions);
+  wireUpdates(view);
   view.querySelectorAll('[data-drill]').forEach((b) => (b.onclick = async () => {
     b.disabled = true;
     try { await startTest({ catIds: [+b.dataset.drill], mode: 'tutor', pools: ['unused', 'incorrect', 'marked', 'correct'], types: ['CS', 'CM'], count: 20 }, pool); } catch (e) { toast(errMsg(e), 'bad'); b.disabled = false; }
@@ -768,6 +804,166 @@ async function startTutor(qs, label, opts, review = false) {
 }
 
 /* =========================================================================
+   Report a question: learners flag a mistake with a comment; the admin
+   sees a count on the Admin tab and Home, and works through them on
+   Admin → Reports.
+   ========================================================================= */
+
+const REPORTS_FROM = Date.parse('2026-11-20T18:00:00Z'); // goes live with the 20 Nov update (8:00 pm Chisinau)
+const reportsOn = () => Date.now() >= REPORTS_FROM || state.profile?.role === 'admin';
+const REPORTABLE = new Map(); // question id -> question, for the report dialog
+const reportedNow = new Set(); // reported in this tab
+
+function reportBtn(q, order, extra = '') {
+  if (!reportsOn()) return '';
+  REPORTABLE.set(q.id, q);
+  const done = reportedNow.has(q.id);
+  return `<button type="button" class="btn ghost sm report-btn${extra}" data-report="${q.id}" data-order="${order.join(',')}" ${done ? 'aria-pressed="true"' : ''} title="Report a mistake in this question">${icon('alert')}${done ? 'Reported' : 'Report'}</button>`;
+}
+
+function openReport(qid, order) {
+  const q = REPORTABLE.get(qid); if (!q) return;
+  document.querySelector('.modal-back')?.remove();
+  const back = document.createElement('div');
+  back.className = 'modal-back';
+  back.innerHTML = `<form class="card modal" role="dialog" aria-modal="true" aria-labelledby="rpT" novalidate>
+      <h2 id="rpT">${icon('alert')}Report this question</h2>
+      <p class="muted small">Tell us what is wrong. The admin will check it against the university file and correct it if needed.</p>
+      <blockquote class="rq-quote">${esc(q.question.length > 220 ? q.question.slice(0, 220) + '…' : q.question)}</blockquote>
+      <label class="field">What is the issue?<span class="help">Use the letters you see on screen (A, B, C…). Required.</span>
+        <textarea name="comment" rows="4" maxlength="1000" required placeholder="For example: option C is cut off, or the answer key looks wrong"></textarea></label>
+      <div class="row-between"><span class="muted small" id="rpCount">0 / 1000</span>
+        <div class="btn-row"><button type="button" class="btn ghost" id="rpCancel">Cancel</button><button class="btn primary" id="rpSend">${icon('check')}Send report</button></div></div>
+      <p class="form-error" id="rpErr" role="alert"></p>
+    </form>`;
+  document.body.appendChild(back);
+  const f = back.querySelector('form'); const ta = f.comment; const err = f.querySelector('#rpErr');
+  const opener = document.activeElement;
+  const close = () => { back.remove(); document.removeEventListener('keydown', onKey, true); if (opener && opener.isConnected) opener.focus({ preventScroll: true }); };
+  const onKey = (e) => { if (e.key === 'Escape') { e.preventDefault(); close(); } };
+  document.addEventListener('keydown', onKey, true);
+  back.addEventListener('mousedown', (e) => { if (e.target === back) close(); });
+  f.querySelector('#rpCancel').onclick = close;
+  ta.oninput = () => { f.querySelector('#rpCount').textContent = `${ta.value.length} / 1000`; err.textContent = ''; };
+  ta.focus();
+  f.onsubmit = async (e) => {
+    e.preventDefault();
+    const comment = ta.value.trim();
+    if (comment.length < 3) { err.textContent = 'Write a few words about what is wrong.'; ta.focus(); return; }
+    const btn = f.querySelector('#rpSend'); btn.disabled = true; btn.textContent = 'Sending…';
+    const { error } = await sb.from('question_reports').insert({ question_id: qid, comment, shown_order: order });
+    if (error && error.code !== '23505') { err.textContent = errMsg(error); btn.disabled = false; btn.innerHTML = `${icon('check')}Send report`; return; }
+    reportedNow.add(qid); close();
+    document.querySelectorAll(`[data-report="${qid}"]`).forEach((b) => { b.setAttribute('aria-pressed', 'true'); b.innerHTML = `${icon('alert')}Reported`; });
+    toast(error ? 'You already reported this question. The admin will check it.' : 'Thanks. The admin has been told and will check this question.', 'ok');
+    reportCache.at = 0;
+  };
+}
+
+document.addEventListener('click', (e) => {
+  const b = e.target.closest && e.target.closest('[data-report]'); if (!b) return;
+  e.preventDefault();
+  openReport(+b.dataset.report, (b.dataset.order || '').split(',').filter((x) => x !== '').map(Number));
+});
+
+const reportCache = { n: 0, at: 0 };
+async function openReportCount(force = false) {
+  if (state.profile?.role !== 'admin') return 0;
+  if (!force && Date.now() - reportCache.at < 60000) return reportCache.n;
+  const { count, error } = await sb.from('question_reports').select('id', { count: 'exact', head: true }).eq('status', 'open');
+  if (error) { if (!missingInDb(error)) console.warn(error); return 0; }
+  reportCache.n = count || 0; reportCache.at = Date.now();
+  return reportCache.n;
+}
+async function paintReportBadge() {
+  const n = await openReportCount();
+  document.querySelectorAll('a[data-nav="admin"]').forEach((a) => {
+    a.querySelector('.nbadge')?.remove();
+    if (n) a.insertAdjacentHTML('beforeend', `<span class="nbadge" aria-label="${n} open report${n > 1 ? 's' : ''}">${n > 99 ? '99+' : n}</span>`);
+  });
+  const tab = document.querySelector('[data-tab-badge]'); if (tab) tab.textContent = n ? String(n) : '';
+}
+const reportsHomeCard = (n) => `<section class="card update" aria-labelledby="rpH">
+  <div class="row-between"><h2 id="rpH">${icon('alert')}${n} question report${n > 1 ? 's' : ''} to check</h2>
+  <a class="btn primary sm" href="#/admin/reports">Open reports ${icon('right')}</a></div>
+  <p class="muted" style="margin:0">Learners flagged possible mistakes. Check each question against the university file, then fix it or mark it as no change needed.</p></section>`;
+
+/* ---------- Admin: reports ---------- */
+
+const REPORT_STATUS = { open: ['Open', 'warn'], fixed: ['Fixed', 'ok'], no_change: ['No change needed', ''] };
+
+async function renderAdminReports() {
+  const view = shell('admin', loading);
+  const meta = await loadMeta(true);
+  const ui = state.rui || (state.rui = { status: 'open' });
+  let q = sb.from('question_reports').select('id,question_id,user_id,comment,shown_order,status,admin_note,created_at,resolved_at').order('created_at', { ascending: false }).limit(500);
+  if (ui.status === 'open') q = q.eq('status', 'open'); else if (ui.status === 'done') q = q.neq('status', 'open');
+  const { data: reps, error } = await q;
+  if (error) {
+    if (missingInDb(error)) { view.innerHTML = adminTabs('reports') + `<section class="card"><h2>${icon('alert')} Reports aren't switched on yet</h2><p class="muted">Run <code>supabase/migration_006_notices_reports.sql</code> in the Supabase SQL Editor, then reload.</p></section>`; return; }
+    throw error;
+  }
+  const qids = [...new Set(reps.map((r) => r.question_id))];
+  const uids = [...new Set(reps.map((r) => r.user_id))];
+  const [qs, people] = await Promise.all([
+    qids.length ? inChunks(qids, 100, (c) => fetchAll(() => sb.from('questions').select(QCOLS + ',active').in('id', c))) : [],
+    uids.length ? inChunks(uids, 100, (c) => fetchAll(() => sb.from('profiles').select('id,full_name,email').in('id', c))) : [],
+  ]);
+  const qById = new Map(qs.map((x) => [x.id, x])); const who = new Map(people.map((p) => [p.id, p.full_name || p.email]));
+  const groups = qids.map((id) => ({ q: qById.get(id), id, reps: reps.filter((r) => r.question_id === id) }));
+  const nOpen = await openReportCount(true);
+
+  const seenAs = (order, q) => (order && order.length && q ? order.map((orig, pos) => `${LETTERS[pos]}=${LETTERS[orig] || '?'}`).join(' · ') : '');
+  const repLine = (r, q) => `<li class="rep">
+      <div class="row-between"><span><b>${esc(who.get(r.user_id) || 'Learner')}</b> <span class="muted small">${esc(fmtDate(r.created_at))}</span></span><span class="chip ${REPORT_STATUS[r.status][1]}">${REPORT_STATUS[r.status][0]}</span></div>
+      <p class="rep-comment">${esc(r.comment)}</p>
+      ${seenAs(r.shown_order, q) ? `<p class="muted small" style="margin:0">Their letters → letters below: ${esc(seenAs(r.shown_order, q))}</p>` : ''}
+      ${r.admin_note ? `<p class="small" style="margin:6px 0 0">${icon('check')} ${esc(r.admin_note)}</p>` : ''}
+    </li>`;
+  const groupCard = (g) => {
+    const q = g.q; const topic = q && meta.topicById.get(q.category_id); const disc = topic && meta.discById.get(topic.discipline_id);
+    const open = g.reps.filter((r) => r.status === 'open').length;
+    return `<li class="card rgroup" data-q="${g.id}">
+      ${q ? `<div class="qmeta">${disc ? `<span class="chip pri">${esc(disc.name)}</span>` : ''}${topic && topic.name !== disc?.name ? `<span class="chip">${esc(topic.name)}</span>` : ''}<span class="chip">${q.qtype}</span><span class="chip">#${q.id}</span>${q.active ? '' : '<span class="chip warn">hidden</span>'}</div>
+      <p class="rq" style="font-weight:600">${esc(q.question)}</p>
+      <ul class="ropts" style="list-style:none;padding:0">${q.options.map((o, i) => `<li class="${q.correct.includes(i) ? 'c' : ''}" style="display:flex;gap:8px"><b>${LETTERS[i]}</b><span>${esc(o)}</span>${q.correct.includes(i) ? '<span class="tag">Correct</span>' : ''}</li>`).join('')}</ul>`
+      : `<p class="muted">This question was deleted.</p>`}
+      <h3 class="small" style="margin:12px 0 6px">${g.reps.length} report${g.reps.length > 1 ? 's' : ''}${open && open !== g.reps.length ? ` · ${open} open` : ''}</h3>
+      <ul class="reps">${g.reps.map((r) => repLine(r, q)).join('')}</ul>
+      <div class="qedit"></div>
+      ${open ? `<div class="resolve">
+        <label class="field" style="margin:12px 0 8px">Note to keep with the report<span class="help">Optional, e.g. what you changed.</span><input type="text" maxlength="300" class="rnote"></label>
+        <div class="btn-row">${q ? `<button class="btn" data-act="edit">${icon('layers')}Edit question</button>` : ''}<button class="btn primary" data-act="fixed">${icon('check')}Mark fixed</button><button class="btn ghost" data-act="no_change">No change needed</button></div></div>` : ''}
+    </li>`;
+  };
+
+  view.innerHTML = `${adminTabs('reports')}
+    <div class="row-between"><h1 style="margin:0">Question reports</h1>
+      <div class="seg" role="group" aria-label="Show">${[['open', `Open (${nOpen})`], ['done', 'Done'], ['all', 'All']].map(([k, l]) => `<button class="btn sm ${ui.status === k ? 'primary' : 'ghost'}" data-status="${k}" aria-pressed="${ui.status === k}">${l}</button>`).join('')}</div></div>
+    <p class="muted">Learners report questions they think are wrong. Check the question against the university file. Edit it if needed, then mark the reports as fixed or as no change needed. Past answers are not re-scored.</p>
+    ${groups.length ? `<ol class="rlist">${groups.map(groupCard).join('')}</ol>` : `<div class="card empty">${icon('check')}<h2>${ui.status === 'open' ? 'No open reports' : 'Nothing here'}</h2><p class="muted">${ui.status === 'open' ? 'When a learner reports a question, it shows up here.' : ''}</p></div>`}`;
+  paintReportBadge();
+
+  view.querySelectorAll('[data-status]').forEach((b) => (b.onclick = () => { ui.status = b.dataset.status; renderAdminReports(); }));
+  view.querySelectorAll('.rgroup').forEach((card) => {
+    const id = +card.dataset.q; const g = groups.find((x) => x.id === id);
+    card.querySelectorAll('[data-act]').forEach((b) => (b.onclick = async () => {
+      if (b.dataset.act === 'edit') {
+        questionEditor(card.querySelector('.qedit'), meta, g.q, { onSaved: () => { toast('Question saved. Now mark the report as fixed.', 'ok'); state.meta = null; renderAdminReports(); } });
+        return;
+      }
+      b.disabled = true;
+      const note = card.querySelector('.rnote')?.value.trim() || null;
+      try {
+        check(await sb.from('question_reports').update({ status: b.dataset.act, admin_note: note, resolved_at: new Date().toISOString(), resolved_by: state.profile.id }).eq('question_id', id).eq('status', 'open'));
+        toast(b.dataset.act === 'fixed' ? 'Marked as fixed.' : 'Marked as no change needed.', 'ok');
+        reportCache.at = 0; renderAdminReports();
+      } catch (err) { b.disabled = false; toast(errMsg(err), 'bad'); }
+    }));
+  });
+}
+
+/* =========================================================================
    Practice: one question at a time with immediate feedback
    ========================================================================= */
 
@@ -816,7 +1012,7 @@ function renderSession() {
         </div>
         <div class="progress" role="progressbar" aria-valuemin="0" aria-valuemax="${n}" aria-valuenow="${run.i}" aria-label="Session progress"><span style="width:${(100 * run.i) / n}%"></span></div>
         <article class="card qcard" aria-labelledby="qtext">
-          <div class="qmeta">${disc ? `<span class="chip pri">${esc(disc.name)}</span>` : ''}${topic && topic.name !== disc?.name ? `<span class="chip">${esc(topic.name)}</span>` : ''}<span class="chip">${multi ? 'Multiple answers' : 'Single answer'}</span><button class="btn ghost sm mark-btn" id="markBtn" aria-pressed="${!!state.marks?.has(q.id)}">${icon('flag')}${state.marks?.has(q.id) ? 'Marked' : 'Mark'}</button></div>
+          <div class="qmeta">${disc ? `<span class="chip pri">${esc(disc.name)}</span>` : ''}${topic && topic.name !== disc?.name ? `<span class="chip">${esc(topic.name)}</span>` : ''}<span class="chip">${multi ? 'Multiple answers' : 'Single answer'}</span><button class="btn ghost sm mark-btn" id="markBtn" aria-pressed="${!!state.marks?.has(q.id)}">${icon('flag')}${state.marks?.has(q.id) ? 'Marked' : 'Mark'}</button>${reportBtn(q, it.order)}</div>
           <h1 class="qtext" id="qtext">${esc(q.question)}</h1>
           <p class="qhint">${multi ? 'Select all correct answers, then check.' : 'Select one answer.'}</p>
           <div class="options" role="${multi ? 'group' : 'radiogroup'}" aria-labelledby="qtext">${optionButtons(it, { reveal: it.done })}</div>
@@ -919,7 +1115,7 @@ function reviewItem(it, meta = state.meta) {
   const topic = meta?.topicById.get(q.category_id);
   const v = it.sel.size ? verdictFor(q, it.sel) : { cls: 'bad', text: 'Not answered', icon: 'x' };
   return `<li>
-    <div class="qmeta"><span class="chip ${v.cls === 'ok' ? 'ok' : v.cls === 'part' ? 'warn' : 'bad'}">${icon(v.icon)}${v.text}</span>${topic ? `<span class="chip">${esc(topic.name)}</span>` : ''}${it.flagged ? `<span class="chip warn">${icon('flag')}Marked</span>` : ''}</div>
+    <div class="qmeta"><span class="chip ${v.cls === 'ok' ? 'ok' : v.cls === 'part' ? 'warn' : 'bad'}">${icon(v.icon)}${v.text}</span>${topic ? `<span class="chip">${esc(topic.name)}</span>` : ''}${it.flagged ? `<span class="chip warn">${icon('flag')}Marked</span>` : ''}${reportBtn(q, it.order, ' mark-btn')}</div>
     <p class="rq">${esc(q.question)}</p>
     <ul class="ropts">${it.order.map((orig, pos) => {
       const key = q.correct.includes(orig); const chosen = it.sel.has(orig);
@@ -1143,7 +1339,7 @@ async function renderExamRun() {
         <div class="run-top"><span class="pos">Question ${ex.i + 1} of ${n}</span><span class="muted small num">${answered} answered</span></div>
         <div class="progress" role="progressbar" aria-valuemin="0" aria-valuemax="${n}" aria-valuenow="${answered}" aria-label="Questions answered"><span style="width:${(100 * answered) / n}%"></span></div>
         <article class="card qcard" aria-labelledby="qtext">
-          <div class="qmeta">${disc ? `<span class="chip pri">${esc(disc.name)}</span>` : ''}<span class="chip">${multi ? 'Multiple answers' : 'Single answer'}</span></div>
+          <div class="qmeta">${disc ? `<span class="chip pri">${esc(disc.name)}</span>` : ''}<span class="chip">${multi ? 'Multiple answers' : 'Single answer'}</span>${reportBtn(q, it.order, ' mark-btn')}</div>
           <h1 class="qtext" id="qtext">${esc(q.question)}</h1>
           <p class="qhint">${multi ? 'Select all correct answers.' : 'Select one answer.'} You can change it until you submit.</p>
           <div class="options" role="${multi ? 'group' : 'radiogroup'}" aria-labelledby="qtext">${optionButtons(it)}</div>
@@ -1498,6 +1694,7 @@ async function adminAction(body) {
 const adminTabs = (active) => `<nav class="tabs" aria-label="Admin sections">
   <a href="#/admin/learners" ${active === 'learners' ? 'aria-current="page"' : ''}>${icon('user')}Learners</a>
   <a href="#/admin/questions" ${active === 'questions' ? 'aria-current="page"' : ''}>${icon('layers')}Questions &amp; blueprint</a>
+  <a href="#/admin/reports" ${active === 'reports' ? 'aria-current="page"' : ''}>${icon('alert')}Reports <span class="tbadge" data-tab-badge>${reportCache.n || ''}</span></a>
   <a href="#/admin/security" ${active === 'security' ? 'aria-current="page"' : ''}>${icon('shield')}Security</a></nav>`;
 
 /* ---------- Admin: security ---------- */
@@ -1807,6 +2004,48 @@ async function importQuestions(items, skipDuplicates, onProgress) {
   return { inserted: rows.length, skipped, newTopics: toCreate.size, newDisciplines: newDiscs.length };
 }
 
+/** Question form (new or edit), shown inside editorEl. */
+function questionEditor(editorEl, meta, q, opts = {}) {
+  if (!meta.topics.length) { toast('Import questions or create a topic first.', 'bad'); return; }
+  const isNew = !q;
+  q = q || { category_id: opts.defaultCat || meta.disciplines.find((d) => d.topics.length)?.topics[0]?.id, question: '', options: ['', '', '', '', ''], correct: [0], explanation: '' };
+  editorEl.innerHTML = `<form class="card" id="qForm" style="border-color:var(--primary)" novalidate>
+    <h2>${isNew ? 'New question' : 'Edit question'}</h2>
+    <label class="field">Topic<select name="category_id">${meta.disciplines.map((d) => `<optgroup label="${esc(d.name)}">${d.topics.map((t) => `<option value="${t.id}" ${t.id === q.category_id ? 'selected' : ''}>${esc(t.name)}</option>`).join('')}</optgroup>`).join('')}</select></label>
+    <label class="field">Question<textarea name="question" rows="3" required>${esc(q.question)}</textarea></label>
+    <label class="field">Options<span class="help">One per line.</span><textarea name="options" rows="5" required>${esc(q.options.join('\n'))}</textarea></label>
+    <fieldset><legend>Correct answers</legend><div class="row" id="corr"></div><p class="muted small">Tick one for single choice, several for multiple choice.</p></fieldset>
+    <label class="field">Explanation<span class="help">Optional. Shown after answering.</span><textarea name="explanation" rows="2">${esc(q.explanation || '')}</textarea></label>
+    <div class="btn-row"><button class="btn primary">Save</button><button type="button" class="btn ghost" id="cancelQ">Cancel</button></div>
+    <p class="form-error" id="qErr" role="alert"></p></form>`;
+  const f = editorEl.querySelector('#qForm');
+  let chosen = new Set(q.correct);
+  const fillCorr = () => {
+    const opts = f.options.value.split('\n').map((s) => s.trim()).filter(Boolean);
+    chosen = new Set([...chosen].filter((i) => i < opts.length));
+    f.querySelector('#corr').innerHTML = opts.map((o, i) => `<label class="choice" style="flex:1 1 140px;padding:8px 12px"><input type="checkbox" value="${i}" ${chosen.has(i) ? 'checked' : ''}><span><b>${LETTERS[i]}</b><small>${esc(o.slice(0, 50))}</small></span></label>`).join('');
+    f.querySelectorAll('#corr input').forEach((c) => (c.onchange = () => { c.checked ? chosen.add(+c.value) : chosen.delete(+c.value); }));
+  };
+  fillCorr(); f.options.oninput = fillCorr;
+  f.querySelector('#cancelQ').onclick = () => (editorEl.innerHTML = '');
+  f.onsubmit = async (ev) => {
+    ev.preventDefault();
+    const err = f.querySelector('#qErr');
+    const options = f.options.value.split('\n').map((s) => s.trim()).filter(Boolean);
+    const correct = [...chosen].sort((a, b) => a - b);
+    if (!f.question.value.trim()) { err.textContent = 'Write the question text.'; f.question.focus(); return; }
+    if (options.length < 2) { err.textContent = 'Add at least 2 options, one per line.'; f.options.focus(); return; }
+    if (!correct.length) { err.textContent = 'Tick at least one correct answer.'; return; }
+    const row = { category_id: +f.category_id.value, question: f.question.value.trim(), options, correct, correct_index: correct[0], qtype: correct.length > 1 ? 'CM' : 'CS', explanation: f.explanation.value.trim() || null };
+    try {
+      if (isNew) check(await sb.from('questions').insert(row)); else check(await sb.from('questions').update(row).eq('id', q.id));
+      toast('Saved.', 'ok'); state.meta = null; opts.onSaved && opts.onSaved();
+    } catch (e2) { err.textContent = errMsg(e2); }
+  };
+  editorEl.scrollIntoView({ behavior: window.matchMedia('(prefers-reduced-motion: reduce)').matches ? 'auto' : 'smooth', block: 'start' });
+  f.question.focus({ preventScroll: true });
+}
+
 async function renderAdminQuestions() {
   const view = shell('admin', loading);
   const meta = await loadMeta(true);
@@ -1945,46 +2184,7 @@ async function renderAdminQuestions() {
 
   // editor
   const editorEl = view.querySelector('#editor');
-  const openEditor = (q) => {
-    if (!meta.topics.length) { toast('Import questions or create a topic first.', 'bad'); return; }
-    const isNew = !q;
-    q = q || { category_id: +fTopic.value || meta.disciplines.find((d) => d.topics.length)?.topics[0]?.id, question: '', options: ['', '', '', '', ''], correct: [0], explanation: '' };
-    editorEl.innerHTML = `<form class="card" id="qForm" style="border-color:var(--primary)" novalidate>
-      <h2>${isNew ? 'New question' : 'Edit question'}</h2>
-      <label class="field">Topic<select name="category_id">${meta.disciplines.map((d) => `<optgroup label="${esc(d.name)}">${d.topics.map((t) => `<option value="${t.id}" ${t.id === q.category_id ? 'selected' : ''}>${esc(t.name)}</option>`).join('')}</optgroup>`).join('')}</select></label>
-      <label class="field">Question<textarea name="question" rows="3" required>${esc(q.question)}</textarea></label>
-      <label class="field">Options<span class="help">One per line.</span><textarea name="options" rows="5" required>${esc(q.options.join('\n'))}</textarea></label>
-      <fieldset><legend>Correct answers</legend><div class="row" id="corr"></div><p class="muted small">Tick one for single choice, several for multiple choice.</p></fieldset>
-      <label class="field">Explanation<span class="help">Optional. Shown after answering.</span><textarea name="explanation" rows="2">${esc(q.explanation || '')}</textarea></label>
-      <div class="btn-row"><button class="btn primary">Save</button><button type="button" class="btn ghost" id="cancelQ">Cancel</button></div>
-      <p class="form-error" id="qErr" role="alert"></p></form>`;
-    const f = editorEl.querySelector('#qForm');
-    let chosen = new Set(q.correct);
-    const fillCorr = () => {
-      const opts = f.options.value.split('\n').map((s) => s.trim()).filter(Boolean);
-      chosen = new Set([...chosen].filter((i) => i < opts.length));
-      f.querySelector('#corr').innerHTML = opts.map((o, i) => `<label class="choice" style="flex:1 1 140px;padding:8px 12px"><input type="checkbox" value="${i}" ${chosen.has(i) ? 'checked' : ''}><span><b>${LETTERS[i]}</b><small>${esc(o.slice(0, 50))}</small></span></label>`).join('');
-      f.querySelectorAll('#corr input').forEach((c) => (c.onchange = () => { c.checked ? chosen.add(+c.value) : chosen.delete(+c.value); }));
-    };
-    fillCorr(); f.options.oninput = fillCorr;
-    f.querySelector('#cancelQ').onclick = () => (editorEl.innerHTML = '');
-    f.onsubmit = async (ev) => {
-      ev.preventDefault();
-      const err = f.querySelector('#qErr');
-      const options = f.options.value.split('\n').map((s) => s.trim()).filter(Boolean);
-      const correct = [...chosen].sort((a, b) => a - b);
-      if (!f.question.value.trim()) { err.textContent = 'Write the question text.'; f.question.focus(); return; }
-      if (options.length < 2) { err.textContent = 'Add at least 2 options, one per line.'; f.options.focus(); return; }
-      if (!correct.length) { err.textContent = 'Tick at least one correct answer.'; return; }
-      const row = { category_id: +f.category_id.value, question: f.question.value.trim(), options, correct, correct_index: correct[0], qtype: correct.length > 1 ? 'CM' : 'CS', explanation: f.explanation.value.trim() || null };
-      try {
-        if (isNew) check(await sb.from('questions').insert(row)); else check(await sb.from('questions').update(row).eq('id', q.id));
-        toast('Saved.', 'ok'); state.meta = null; renderAdminQuestions();
-      } catch (e2) { err.textContent = errMsg(e2); }
-    };
-    editorEl.scrollIntoView({ behavior: window.matchMedia('(prefers-reduced-motion: reduce)').matches ? 'auto' : 'smooth', block: 'start' });
-    f.question.focus({ preventScroll: true });
-  };
+  const openEditor = (q) => questionEditor(editorEl, meta, q, { defaultCat: +fTopic.value, onSaved: () => renderAdminQuestions() });
   view.querySelector('#newQ').onclick = () => openEditor(null);
 }
 
