@@ -83,6 +83,7 @@ const store = {
 };
 const prefsKey = () => 'mcq-prefs:' + (state.profile ? state.profile.id : '');
 const draftKey = () => 'mcq-exam-draft:' + (state.profile ? state.profile.id : '');
+const practiceKey = () => 'mcq-practice-draft:' + (state.profile ? state.profile.id : '');
 function download(filename, text, type = 'application/json') {
   const url = URL.createObjectURL(new Blob([text], { type }));
   const a = Object.assign(document.createElement('a'), { href: url, download: filename });
@@ -633,6 +634,8 @@ async function renderHome() {
 
     ${countdownCard()}
 
+    ${practiceDraftInfo() ? practiceResumeCard(practiceDraftInfo()) : ''}
+
     ${nReports ? reportsHomeCard(nReports) : ''}${updateCards(notices)}
 
     <div class="grid stats">
@@ -674,6 +677,7 @@ async function renderHome() {
 
   drawCurveInto(view.querySelector('#curve'), sessions);
   wireUpdates(view);
+  wirePracticeResume(view, renderHome);
   tickCountdowns();
   view.querySelectorAll('[data-drill]').forEach((b) => (b.onclick = async () => {
     b.disabled = true;
@@ -739,6 +743,8 @@ async function renderPractice() {
   view.innerHTML = `
     <div class="page-head"><div><h1>Create a test</h1><p class="muted">Work through a subject one pass at a time: unused questions first, then your incorrect ones, then mixed blocks. Answers are marked against the official key.</p></div></div>
 
+    ${practiceDraftInfo() ? practiceResumeCard(practiceDraftInfo()) : ''}
+
     <section class="card" aria-labelledby="tm">
       <fieldset><legend id="tm">Test mode</legend>
         <div class="choices">
@@ -790,6 +796,7 @@ async function renderPractice() {
       <span id="selInfo" class="muted" aria-live="polite"></span>
       <button class="btn primary lg" id="start">Create test ${icon('right')}</button>
     </div></div>`;
+  wirePracticeResume(view, renderPractice);
 
   const topicBoxes = [...view.querySelectorAll('.topic input')];
   const discBoxes = [...view.querySelectorAll('[data-discall]')];
@@ -885,9 +892,68 @@ async function startTest(o, pool) {
 async function startTutor(qs, label, opts, review = false) {
   const sessionId = check(await sb.rpc('start_session', { p_mode: review ? 'review' : 'topic', p_label: label, p_total: qs.length }));
   if (!state.marks) await loadPool();
+  closePracticeDraft();
   state.run = { opts, sessionId, label, i: 0, startedAt: Date.now(),
     items: qs.map((q) => ({ q, order: optionOrder(q.options), sel: new Set(), done: false, ok: null, saved: null })) };
+  savePractice();
   if (location.hash === '#/session') renderSession(); else location.hash = '#/session';
+}
+
+/* ---------------------------------------------------------------
+   Unfinished practice tests are kept on this device, so a learner who
+   closes the tab, is signed out or signs out can carry on later.
+   Only question ids, option order and answers are stored, not the
+   question text. Answers already checked are also saved on the server.
+---------------------------------------------------------------- */
+function savePractice(run = state.run) {
+  if (!run || run.ended || !state.profile) return;
+  store.set(practiceKey(), { sessionId: run.sessionId, label: run.label, opts: run.opts || null, i: run.i, startedAt: run.startedAt, savedAt: Date.now(),
+    items: run.items.map((it) => ({ id: it.q.id, order: it.order, sel: [...it.sel], done: it.done, ok: it.ok })) });
+}
+/** Drop the saved draft; if it belonged to another session, close that session on the server. */
+function closePracticeDraft() {
+  const d = store.get(practiceKey());
+  store.del(practiceKey());
+  if (d && d.sessionId && d.sessionId !== state.run?.sessionId) sb.rpc('finish_session', { p_session_id: d.sessionId }).then(() => {}, () => {});
+}
+const practiceDraftInfo = () => {
+  const d = store.get(practiceKey());
+  if (!d || !Array.isArray(d.items) || !d.items.length) return null;
+  return { label: d.label || 'Practice test', answered: d.items.filter((x) => x.done).length, total: d.items.length, savedAt: d.savedAt };
+};
+async function resumePractice() {
+  const d = store.get(practiceKey());
+  if (!d || !Array.isArray(d.items) || !d.items.length) return false;
+  await loadMeta();
+  if (!state.marks) await loadPool();
+  const qs = await fetchQuestions(d.items.map((x) => x.id));
+  const byId = new Map(qs.map((q) => [q.id, q]));
+  const items = d.items.filter((x) => byId.has(x.id)).map((x) => {
+    const q = byId.get(x.id);
+    const okOrder = Array.isArray(x.order) && x.order.length === q.options.length && sameSet(x.order, q.options.map((_, k) => k));
+    return { q, order: okOrder ? x.order : optionOrder(q.options), sel: new Set(x.sel || []), done: !!x.done, ok: x.done ? sameSet(x.sel || [], q.correct) : null, saved: x.done ? true : null };
+  });
+  if (!items.length) { store.del(practiceKey()); return false; }
+  const firstOpen = items.findIndex((x) => !x.done);
+  state.run = { opts: d.opts, sessionId: d.sessionId, label: d.label, startedAt: d.startedAt, items,
+    i: firstOpen === -1 ? items.length - 1 : Math.min(Math.max(d.i || 0, 0), firstOpen) };
+  return true;
+}
+const practiceResumeCard = (info) => `<div class="card tight row-between" style="border-color:var(--warn)"><div class="row">${icon('book')}<div><b>You have an unfinished practice test.</b><br>
+  <span class="muted small">${esc(info.label)} · ${info.answered} of ${info.total} answered</span></div></div>
+  <div class="btn-row"><button class="btn ghost sm" type="button" data-practice-discard>Discard</button><button class="btn primary" type="button" data-practice-resume>Continue test ${icon('right')}</button></div></div>`;
+function wirePracticeResume(root, rerender) {
+  const go = root.querySelector('[data-practice-resume]');
+  if (go) go.onclick = async () => {
+    go.disabled = true;
+    try { if (await resumePractice()) location.hash = '#/session'; else { toast('That test could not be restored.', 'bad'); rerender(); } }
+    catch (e) { toast(errMsg(e), 'bad'); go.disabled = false; }
+  };
+  const del = root.querySelector('[data-practice-discard]');
+  if (del) del.onclick = () => {
+    if (!confirm('Discard the unfinished practice test? Answers you already checked stay in your progress.')) return;
+    closePracticeDraft(); rerender();
+  };
 }
 
 /* =========================================================================
@@ -1079,9 +1145,11 @@ function optionButtons(it, { reveal = false, disabled = false } = {}) {
   }).join('');
 }
 
-function renderSession() {
+async function renderSession() {
+  if (!state.run && store.get(practiceKey())) { try { await resumePractice(); } catch (e) { console.warn(e); } }
   const run = state.run;
   if (!run) { location.hash = '#/practice'; return; }
+  savePractice(run);
   if (run.ended || run.i >= run.items.length) return renderSessionSummary();
   const meta = state.meta;
   const it = run.items[run.i]; const q = it.q; const n = run.items.length;
@@ -1177,6 +1245,7 @@ function renderSessionSummary() {
   const wrong = done.filter((x) => !x.ok);
   const score = done.length ? Math.round((100 * right) / done.length) : 0;
   if (!run.finished) { run.finished = true; sb.rpc('finish_session', { p_session_id: run.sessionId }).then(() => {}, () => {}); }
+  if (store.get(practiceKey())?.sessionId === run.sessionId) store.del(practiceKey());
   const view = shell('practice', `
     <section class="card"><div class="result-head">
       <div class="ring" style="--p:${score};--c:var(${score >= 75 ? '--ok' : score >= 50 ? '--warn' : '--bad'})"><span>${score}%</span></div>
