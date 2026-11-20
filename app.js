@@ -9,7 +9,7 @@ const configured = !SUPABASE_URL.includes('YOUR-PROJECT') && !SUPABASE_ANON_KEY.
 const sb = configured ? createClient(SUPABASE_URL, SUPABASE_ANON_KEY) : null;
 const $app = document.getElementById('app');
 const LETTERS = 'ABCDEFGHIJ';
-const state = { profile: null, meta: null, run: null, exam: null, examResult: null, flash: '', timer: null };
+const state = { profile: null, meta: null, run: null, exam: null, examResult: null, drafts: null, flash: '', timer: null };
 document.title = APP_NAME;
 
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]);
@@ -84,6 +84,58 @@ const store = {
 const prefsKey = () => 'mcq-prefs:' + (state.profile ? state.profile.id : '');
 const draftKey = () => 'mcq-exam-draft:' + (state.profile ? state.profile.id : '');
 const practiceKey = () => 'mcq-practice-draft:' + (state.profile ? state.profile.id : '');
+
+/* ---------------------------------------------------------------
+   Unfinished tests live in the database (table test_drafts): one
+   'practice' and one 'exam' per learner, so they can be continued on
+   any device. Writes per kind are queued so the latest one always wins.
+   Drafts saved on a device by the earlier version are moved up once.
+---------------------------------------------------------------- */
+const LOCAL_DRAFT = { practice: practiceKey, exam: draftKey };
+const draftQ = {};
+async function loadDrafts(force = false) {
+  if (state.drafts && !force) return state.drafts;
+  const { data, error } = await sb.from('test_drafts').select('kind,session_id,state');
+  const drafts = {};
+  if (error) { if (!missingInDb(error)) console.warn(error); }
+  else (data || []).forEach((r) => { drafts[r.kind] = { ...r.state, sessionId: r.session_id }; });
+  for (const kind of Object.keys(draftQ)) {                 // a save still on its way: trust what this tab has
+    if (draftQ[kind].busy && state.drafts) { if (state.drafts[kind]) drafts[kind] = state.drafts[kind]; else delete drafts[kind]; }
+  }
+  state.drafts = drafts;
+  if (error) return state.drafts;
+  for (const kind of Object.keys(LOCAL_DRAFT)) {           // one-time move from this device
+    const local = store.get(LOCAL_DRAFT[kind]());
+    if (!local) continue;
+    store.del(LOCAL_DRAFT[kind]());
+    if (!drafts[kind] && local.sessionId && Array.isArray(local.items)) putDraft(kind, local);
+  }
+  return state.drafts;
+}
+function putDraft(kind, d) {
+  if (!state.profile) return;
+  state.drafts = state.drafts || {};
+  state.drafts[kind] = d;
+  const q = (draftQ[kind] = draftQ[kind] || { busy: false, next: undefined, last: '' });
+  const json = d ? JSON.stringify(d) : '';
+  if (json === q.last && q.next === undefined) return;      // nothing changed
+  q.next = d;
+  if (q.busy) return;
+  q.busy = true;
+  (async () => {
+    while (q.next !== undefined) {
+      const cur = q.next; q.next = undefined;
+      const uid = state.profile?.id; if (!uid) break;
+      const { error } = cur
+        ? await sb.from('test_drafts').upsert({ user_id: uid, kind, session_id: cur.sessionId, state: cur, updated_at: new Date().toISOString() }, { onConflict: 'user_id,kind' })
+        : await sb.from('test_drafts').delete().eq('user_id', uid).eq('kind', kind);
+      if (error) { if (!missingInDb(error)) console.warn('Draft not saved', error); q.last = ''; }
+      else q.last = cur ? JSON.stringify(cur) : '';
+    }
+    q.busy = false;
+  })();
+}
+const dropDraft = (kind) => putDraft(kind, null);
 function download(filename, text, type = 'application/json') {
   const url = URL.createObjectURL(new Blob([text], { type }));
   const a = Object.assign(document.createElement('a'), { href: url, download: filename });
@@ -603,7 +655,7 @@ function openCountdownPopup() {
 
 async function renderHome() {
   const view = shell('home', loading);
-  const [meta, stats, sessions, pool, notices, nReports] = await Promise.all([loadMeta(), topicStats(state.profile.id), sessionsFor(state.profile.id), loadPool(), loadAnnouncements(), state.profile.role === 'admin' ? openReportCount(true) : 0]);
+  const [meta, stats, sessions, pool, notices, nReports] = await Promise.all([loadMeta(), topicStats(state.profile.id), sessionsFor(state.profile.id), loadPool(), loadAnnouncements(), state.profile.role === 'admin' ? openReportCount(true) : 0, loadDrafts(true)]);
   const totalQs = sum(meta.disciplines.map((d) => d.total));
   const nUnused = pool.filter((q) => q.status === 'unused').length;
   const nWrong = pool.filter((q) => q.status === 'incorrect').length;
@@ -618,7 +670,7 @@ async function renderHome() {
   const overall = rollUp([...stats.values()]);
   const mocks = sessions.filter((s) => s.mode === 'mock' && s.finished_at);
   const lastMock = mocks[mocks.length - 1];
-  const draft = store.get(draftKey());
+  const draft = state.drafts?.exam;
   const weakest = r.per.flatMap((p) => p.d.topics.map((t) => ({ t, d: p.d, s: stats.get(t.id) })))
     .filter((x) => x.s && x.s.attempts >= 5)
     .map((x) => ({ ...x, acc: pctNum(x.s.correct, x.s.attempts) }))
@@ -727,7 +779,7 @@ async function toggleMark(qid) {
 
 async function renderPractice() {
   const view = shell('practice', loading);
-  const [meta, pool] = await Promise.all([loadMeta(), loadPool()]);
+  const [meta, pool] = await Promise.all([loadMeta(), loadPool(), loadDrafts(true)]);
   const discs = meta.disciplines.filter((d) => d.total);
   if (!discs.length) { view.innerHTML = `<div class="card empty">${icon('book')}<h2>No questions yet</h2></div>`; return; }
 
@@ -906,23 +958,23 @@ async function startTutor(qs, label, opts, review = false) {
    question text. Answers already checked are also saved on the server.
 ---------------------------------------------------------------- */
 function savePractice(run = state.run) {
-  if (!run || run.ended || !state.profile) return;
-  store.set(practiceKey(), { sessionId: run.sessionId, label: run.label, opts: run.opts || null, i: run.i, startedAt: run.startedAt, savedAt: Date.now(),
+  if (!run || run.ended || !state.profile || run.i >= run.items.length) return;
+  putDraft('practice', { sessionId: run.sessionId, label: run.label, opts: run.opts || null, i: run.i, startedAt: run.startedAt,
     items: run.items.map((it) => ({ id: it.q.id, order: it.order, sel: [...it.sel], done: it.done, ok: it.ok })) });
 }
 /** Drop the saved draft; if it belonged to another session, close that session on the server. */
 function closePracticeDraft() {
-  const d = store.get(practiceKey());
-  store.del(practiceKey());
+  const d = state.drafts?.practice;
+  if (d) dropDraft('practice');
   if (d && d.sessionId && d.sessionId !== state.run?.sessionId) sb.rpc('finish_session', { p_session_id: d.sessionId }).then(() => {}, () => {});
 }
 const practiceDraftInfo = () => {
-  const d = store.get(practiceKey());
+  const d = state.drafts?.practice;
   if (!d || !Array.isArray(d.items) || !d.items.length) return null;
   return { label: d.label || 'Practice test', answered: d.items.filter((x) => x.done).length, total: d.items.length, savedAt: d.savedAt };
 };
 async function resumePractice() {
-  const d = store.get(practiceKey());
+  const d = (await loadDrafts()).practice;
   if (!d || !Array.isArray(d.items) || !d.items.length) return false;
   await loadMeta();
   if (!state.marks) await loadPool();
@@ -933,7 +985,7 @@ async function resumePractice() {
     const okOrder = Array.isArray(x.order) && x.order.length === q.options.length && sameSet(x.order, q.options.map((_, k) => k));
     return { q, order: okOrder ? x.order : optionOrder(q.options), sel: new Set(x.sel || []), done: !!x.done, ok: x.done ? sameSet(x.sel || [], q.correct) : null, saved: x.done ? true : null };
   });
-  if (!items.length) { store.del(practiceKey()); return false; }
+  if (!items.length) { dropDraft('practice'); return false; }
   const firstOpen = items.findIndex((x) => !x.done);
   state.run = { opts: d.opts, sessionId: d.sessionId, label: d.label, startedAt: d.startedAt, items,
     i: firstOpen === -1 ? items.length - 1 : Math.min(Math.max(d.i || 0, 0), firstOpen) };
@@ -946,7 +998,7 @@ function wirePracticeResume(root, rerender) {
   const go = root.querySelector('[data-practice-resume]');
   if (go) go.onclick = async () => {
     go.disabled = true;
-    try { if (await resumePractice()) location.hash = '#/session'; else { toast('That test could not be restored.', 'bad'); rerender(); } }
+    try { state.run = null; if (await resumePractice()) location.hash = '#/session'; else { toast('That test could not be restored.', 'bad'); rerender(); } }
     catch (e) { toast(errMsg(e), 'bad'); go.disabled = false; }
   };
   const del = root.querySelector('[data-practice-discard]');
@@ -1146,7 +1198,7 @@ function optionButtons(it, { reveal = false, disabled = false } = {}) {
 }
 
 async function renderSession() {
-  if (!state.run && store.get(practiceKey())) { try { await resumePractice(); } catch (e) { console.warn(e); } }
+  if (!state.run) { try { if ((await loadDrafts()).practice) await resumePractice(); } catch (e) { console.warn(e); } }
   const run = state.run;
   if (!run) { location.hash = '#/practice'; return; }
   savePractice(run);
@@ -1245,7 +1297,7 @@ function renderSessionSummary() {
   const wrong = done.filter((x) => !x.ok);
   const score = done.length ? Math.round((100 * right) / done.length) : 0;
   if (!run.finished) { run.finished = true; sb.rpc('finish_session', { p_session_id: run.sessionId }).then(() => {}, () => {}); }
-  if (store.get(practiceKey())?.sessionId === run.sessionId) store.del(practiceKey());
+  if (state.drafts?.practice?.sessionId === run.sessionId) dropDraft('practice');
   const view = shell('practice', `
     <section class="card"><div class="result-head">
       <div class="ring" style="--p:${score};--c:var(${score >= 75 ? '--ok' : score >= 50 ? '--warn' : '--bad'})"><span>${score}%</span></div>
@@ -1342,8 +1394,8 @@ function poolByDisc(meta, pool) {
 
 async function renderExamSetup() {
   const view = shell('exam', loading);
-  const [meta, pool] = await Promise.all([loadMeta(), loadPool()]);
-  const draft = store.get(draftKey());
+  const [meta, pool] = await Promise.all([loadMeta(), loadPool(), loadDrafts(true)]);
+  const draft = state.drafts?.exam;
   const totalQs = sum(meta.disciplines.map((d) => d.total));
   if (!totalQs) { view.innerHTML = `<div class="card empty">${icon('exam')}<h2>No questions yet</h2></div>`; return; }
   const prefs = store.get(prefsKey()) || {};
@@ -1410,7 +1462,7 @@ async function renderExamSetup() {
   });
   draw();
   const discard = view.querySelector('#discard');
-  if (discard) discard.onclick = () => { if (confirm('Discard the unfinished test? Nothing from it will be saved.')) { store.del(draftKey()); state.exam = null; renderExamSetup(); } };
+  if (discard) discard.onclick = () => { if (confirm('Discard the unfinished test? Nothing from it will be saved.')) { const d = state.drafts?.exam; dropDraft('exam'); if (d?.sessionId) sb.rpc('finish_session', { p_session_id: d.sessionId }).then(() => {}, () => {}); state.exam = null; renderExamSetup(); } };
 
   view.querySelector('#go').onclick = async (ev) => {
     if (draft && !confirm('Starting a new exam discards your unfinished test. Continue?')) return;
@@ -1444,6 +1496,8 @@ async function startExamWith(qs, { mode, label, timed, opts = null }) {
   if (!state.marks) await loadPool();
   const items = qs.map((q) => ({ q, order: optionOrder(q.options), sel: new Set(), flagged: state.marks.has(q.id) }));
   const sessionId = check(await sb.rpc('start_session', { p_mode: mode, p_label: label, p_total: items.length }));
+  const old = state.drafts?.exam;
+  if (old?.sessionId && old.sessionId !== sessionId) sb.rpc('finish_session', { p_session_id: old.sessionId }).then(() => {}, () => {});
   state.exam = { sessionId, mode, label, opts, timed, startedAt: Date.now(), endsAt: timed ? Date.now() + items.length * 60000 : null, i: 0, items };
   saveDraft();
   if (location.hash === '#/exam/run') renderExamRun(); else location.hash = '#/exam/run';
@@ -1452,11 +1506,11 @@ const examNav = (ex) => (ex && ex.mode !== 'mock' ? 'practice' : 'exam');
 
 function saveDraft() {
   const ex = state.exam; if (!ex || ex.submitted) return;
-  store.set(draftKey(), { sessionId: ex.sessionId, mode: ex.mode, opts: ex.opts, label: ex.label, timed: ex.timed, startedAt: ex.startedAt, endsAt: ex.endsAt, i: ex.i,
+  putDraft('exam', { sessionId: ex.sessionId, mode: ex.mode, opts: ex.opts, label: ex.label, timed: ex.timed, startedAt: ex.startedAt, endsAt: ex.endsAt, i: ex.i,
     items: ex.items.map((it) => ({ id: it.q.id, order: it.order, sel: [...it.sel], flagged: it.flagged })) });
 }
 async function restoreDraft() {
-  const d = store.get(draftKey()); if (!d) return false;
+  const d = (await loadDrafts()).exam; if (!d || !Array.isArray(d.items)) return false;
   const qs = await fetchQuestions(d.items.map((x) => x.id));
   const qById = new Map(qs.map((q) => [q.id, q]));
   const items = d.items.filter((x) => qById.has(x.id)).map((x) => ({ q: qById.get(x.id), order: x.order, sel: new Set(x.sel), flagged: x.flagged }));
@@ -1480,7 +1534,7 @@ function startTimer() {
 
 async function renderExamRun() {
   if (!state.exam || state.exam.submitted) {
-    shell(examNav(store.get(draftKey())), loading);
+    shell(examNav(state.drafts?.exam), loading);
     if (!(await restoreDraft())) { location.hash = '#/exam'; return; }
   }
   const ex = state.exam; const meta = await loadMeta();
@@ -1561,7 +1615,7 @@ async function submitExam() {
   if (ex.items.some((x) => x.saved === false) && !(await heartbeat(false, true))) return;
   await sb.rpc('finish_session', { p_session_id: ex.sessionId }).then(() => {}, () => {});
   ex.submitted = true; ex.finishedAt = Date.now();
-  store.del(draftKey());
+  dropDraft('exam');
   state.examResult = ex; state.exam = null;
   location.hash = '#/exam/result';
 }
@@ -2362,7 +2416,7 @@ async function renderAdminQuestions() {
       if (!SEC.leaving && !state.flash) state.flash = 'You were signed out. This happens when your account is signed in on another device or your session ends.';
       stopSecurityTimers();
       clearInterval(state.timer);
-      Object.assign(state, { profile: null, meta: null, run: null, exam: null, examResult: null });
+      Object.assign(state, { profile: null, meta: null, run: null, exam: null, examResult: null, drafts: null });
       document.getElementById('toasts').replaceChildren();
       setTimeout(() => (location.hash === '' || location.hash === '#/login' ? router() : (location.hash = '#/login')), 0);
     }
