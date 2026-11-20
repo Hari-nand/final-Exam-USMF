@@ -419,6 +419,7 @@ async function router() {
   const fn = routes[route] || renderHome;
   try {
     await fn(param);
+    if (state.justSignedIn) { state.justSignedIn = false; openCountdownPopup(); }
     if (route !== lastRoute) { const v = document.getElementById('view'); if (v) v.focus({ preventScroll: true }); window.scrollTo(0, 0); }
     lastRoute = route;
   } catch (e) {
@@ -473,6 +474,7 @@ function renderLogin() {
       const r = await claimSession();
       if (!r.ok) { await forceSignOut(secMessage(r)); return; }
       startSecurityTimers();
+      state.justSignedIn = true;
       if (!location.hash || location.hash === '#/login') location.hash = '#/home'; else router();
     } catch (e) {
       errEl.textContent = errMsg(e);
@@ -516,6 +518,88 @@ function wireUpdates(root) {
   }));
 }
 
+/* ---------------------------------------------------------------
+   Exam countdown + daily motivation: a card on Home, and a popup
+   once after each sign-in. Times are Chisinau time (EET, UTC+2).
+---------------------------------------------------------------- */
+const EXAMS = [
+  { key: 'mock', name: 'Mock exam', at: '2026-11-24T08:00:00+02:00' },
+  { key: 'final', name: 'Final exam', at: '2026-12-07T08:00:00+02:00' },
+];
+const EXAM_DAY_MS = 12 * 3600e3; // after the start time, show "today" for 12 hours, then "done"
+const QUOTES = [
+  'Every question you answer today is one less surprise on exam day.',
+  'Six years of work got you here. A few more focused days will carry you through.',
+  'Do not aim for perfect. Aim for one more topic than yesterday.',
+  'Your wrong answers are your best teachers. Review them, then move on.',
+  'Small, steady sessions beat one long panic. Keep showing up.',
+  'You already know more than you think. Now prove it to yourself, one block at a time.',
+  'Calm mind, clear reading, one option at a time.',
+  'Future patients are the reason. This exam is just a step on the way.',
+  'Progress, not pressure. Do the next question.',
+  'Tired is normal. Quitting is optional. Rest well, then come back stronger.',
+  'Discipline today, a white coat with your name on it tomorrow.',
+  'Read the whole question, trust your preparation, and keep going.',
+  'Hard topics shrink every time you face them.',
+  'The finish line is close. Finish like you started: with purpose.',
+];
+const quoteOfDay = () => QUOTES[Math.floor((Date.now() + 2 * 3600e3) / 864e5) % QUOTES.length];
+const upcomingExams = () => EXAMS.filter((e) => Date.now() < Date.parse(e.at) + EXAM_DAY_MS);
+
+function countdownParts(at) {
+  const ms = Date.parse(at) - Date.now();
+  if (ms <= 0) return null;
+  const s = Math.floor(ms / 1000);
+  return [[Math.floor(s / 86400), 'days'], [Math.floor(s / 3600) % 24, 'hours'], [Math.floor(s / 60) % 60, 'min'], [s % 60, 'sec']];
+}
+function countdownInner(e) {
+  const p = countdownParts(e.at);
+  if (!p) return `<span class="cd-today">${icon('check')}Today. Good luck!</span>`;
+  return p.map(([n, l]) => `<span class="cd-unit"><b>${String(n).padStart(2, '0')}</b><small>${l}</small></span>`).join('');
+}
+function countdownHTML(list = upcomingExams()) {
+  return `<div class="cd-grid">${list.map((e) => `
+    <div class="cd-item">
+      <div class="cd-head"><b>${esc(e.name)}</b><span class="muted small">${esc(longDate(e.at))}</span></div>
+      <div class="cd-clock" data-countdown="${esc(e.key)}">${countdownInner(e)}</div>
+    </div>`).join('')}</div>`;
+}
+const quoteHTML = () => `<blockquote class="cd-quote">${icon('target')}<span>${esc(quoteOfDay())}</span></blockquote>`;
+function countdownCard() {
+  const list = upcomingExams();
+  if (!list.length) return '';
+  return `<section class="card countdown" aria-labelledby="cdH"><h2 id="cdH">${icon('clock')}Exam countdown</h2>${countdownHTML(list)}${quoteHTML()}</section>`;
+}
+let cdTimer = null;
+function tickCountdowns() {
+  if (cdTimer) return;
+  cdTimer = setInterval(() => {
+    const els = document.querySelectorAll('[data-countdown]');
+    if (!els.length) { clearInterval(cdTimer); cdTimer = null; return; }
+    els.forEach((el) => { const e = EXAMS.find((x) => x.key === el.dataset.countdown); if (e) el.innerHTML = countdownInner(e); });
+  }, 1000);
+}
+function openCountdownPopup() {
+  const list = upcomingExams();
+  if (!list.length) return;
+  document.querySelector('.modal-back')?.remove();
+  const first = (state.profile.full_name || '').split(' ')[0];
+  const back = document.createElement('div');
+  back.className = 'modal-back';
+  back.innerHTML = `<div class="card modal countdown" role="dialog" aria-modal="true" aria-labelledby="cdP">
+      <h2 id="cdP">${icon('clock')}${first ? `Welcome back, ${esc(first)}` : 'Welcome back'}</h2>
+      ${countdownHTML(list)}${quoteHTML()}
+      <div class="btn-row"><button class="btn primary" type="button" id="cdGo">Let's study ${icon('right')}</button></div>
+    </div>`;
+  document.body.appendChild(back);
+  const close = () => { back.remove(); document.removeEventListener('keydown', onKey, true); };
+  const onKey = (e) => { if (e.key === 'Escape') { e.preventDefault(); close(); } };
+  document.addEventListener('keydown', onKey, true);
+  back.addEventListener('mousedown', (e) => { if (e.target === back) close(); });
+  const go = back.querySelector('#cdGo'); go.onclick = close; go.focus();
+  tickCountdowns();
+}
+
 async function renderHome() {
   const view = shell('home', loading);
   const [meta, stats, sessions, pool, notices, nReports] = await Promise.all([loadMeta(), topicStats(state.profile.id), sessionsFor(state.profile.id), loadPool(), loadAnnouncements(), state.profile.role === 'admin' ? openReportCount(true) : 0]);
@@ -546,6 +630,8 @@ async function renderHome() {
 
     ${draft ? `<div class="card tight row-between" style="border-color:var(--warn)"><div class="row">${icon('clock')}<div><b>You have an unfinished test.</b><br><span class="muted small">${esc(draft.label || '')}</span></div></div>
       <a class="btn primary" href="#/exam/run">Resume exam</a></div>` : ''}
+
+    ${countdownCard()}
 
     ${nReports ? reportsHomeCard(nReports) : ''}${updateCards(notices)}
 
@@ -588,6 +674,7 @@ async function renderHome() {
 
   drawCurveInto(view.querySelector('#curve'), sessions);
   wireUpdates(view);
+  tickCountdowns();
   view.querySelectorAll('[data-drill]').forEach((b) => (b.onclick = async () => {
     b.disabled = true;
     try { await startTest({ catIds: [+b.dataset.drill], mode: 'tutor', pools: ['unused', 'incorrect', 'marked', 'correct'], types: ['CS', 'CM'], count: 20 }, pool); } catch (e) { toast(errMsg(e), 'bad'); b.disabled = false; }
