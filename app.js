@@ -2143,6 +2143,29 @@ async function renderAdminSecurity() {
   }));
 }
 
+/* Presence: from open sign-in sessions. last_seen moves once a minute, and only
+   when the person actually did something, so it means "last activity". */
+const ONLINE_ACTIVE_MIN = 3;
+async function loadPresence() {
+  const { data, error } = await sb.from('user_sessions').select('user_id,last_seen').is('ended_at', null);
+  if (error) { if (!missingInDb(error)) console.warn(error); return null; }
+  const m = new Map();
+  for (const r of data || []) { const t = Date.parse(r.last_seen); if (!m.has(r.user_id) || t > m.get(r.user_id)) m.set(r.user_id, t); }
+  return m;
+}
+function presenceBadge(lastSeen) {
+  const idleLimit = Number(SEC.idle) > 0 ? Number(SEC.idle) : 30;
+  const mins = lastSeen ? Math.floor((Date.now() - lastSeen) / 60000) : Infinity;
+  if (mins < ONLINE_ACTIVE_MIN) return `<span class="chip ok presence"><span class="dot on"></span>Online · active now</span>`;
+  if (mins < idleLimit) return `<span class="chip warn presence" title="Signed in, no activity for ${mins} min"><span class="dot idle"></span>Online · idle ${mins} min</span>`;
+  return `<span class="chip presence"><span class="dot"></span>Offline</span>`;
+}
+function paintPresence(root, presence) {
+  root.querySelectorAll('[data-presence]').forEach((el) => { el.innerHTML = presence ? presenceBadge(presence.get(el.dataset.presence)) : ''; });
+  const n = presence ? [...presence.values()].filter((t) => Date.now() - t < ONLINE_ACTIVE_MIN * 60000).length : 0;
+  const sum = root.querySelector('#presenceSum'); if (sum && presence) sum.textContent = `${n} active now · updates every minute`;
+}
+
 async function renderAdminLearners() {
   const view = shell('admin', loading);
   const [profiles, stats, sessions, events] = await Promise.all([
@@ -2151,13 +2174,14 @@ async function renderAdminLearners() {
     fetchAll(() => sb.from('sessions').select('user_id,mode,answered,correct,total,started_at').gt('answered', 0).order('started_at')),
     loadLoginEvents(7),
   ]);
+  const presence = await loadPresence();
   const byUser = new Map();
   for (const r of stats) { if (!byUser.has(r.user_id)) byUser.set(r.user_id, []); byUser.get(r.user_id).push(r); }
   const sessByUser = new Map();
   for (const s of sessions) { if (!sessByUser.has(s.user_id)) sessByUser.set(s.user_id, []); sessByUser.get(s.user_id).push(s); }
 
   view.innerHTML = `${adminTabs('learners')}
-    <div class="row-between"><h1 style="margin:0">Learners</h1><button class="btn primary" id="showAdd">+ Add learner</button></div>
+    <div class="row-between"><div><h1 style="margin:0">Learners</h1><p class="muted small" id="presenceSum" style="margin:4px 0 0"></p></div><button class="btn primary" id="showAdd">+ Add learner</button></div>
     <form class="card" id="addForm" hidden novalidate>
       <h2>Add a learner</h2>
       <div class="grid two">
@@ -2171,7 +2195,7 @@ async function renderAdminLearners() {
     </form>
     <div id="created"></div>
     <section class="card"><div class="table-wrap"><table>
-      <thead><tr><th>Name</th><th>Email</th><th class="n">Practised</th><th class="n">Accuracy</th><th class="n">Mock exams</th><th class="n">Latest mock</th><th>Last active</th>${events ? '<th>Last sign-in</th>' : ''}<th>Status</th></tr></thead>
+      <thead><tr><th>Name</th><th>Email</th><th class="n">Practised</th><th class="n">Accuracy</th><th class="n">Mock exams</th><th class="n">Latest mock</th><th>Last active</th>${events ? '<th>Last sign-in</th>' : ''}<th>Account</th></tr></thead>
       <tbody>${profiles.map((p) => {
         const s = rollUp(byUser.get(p.id) || []); const ss = sessByUser.get(p.id) || []; const mocks = ss.filter((x) => x.mode === 'mock');
         const last = ss.length ? ss[ss.length - 1].started_at : s.last;
@@ -2179,11 +2203,19 @@ async function renderAdminLearners() {
           <td><a href="#/admin/learner/${p.id}">${esc(p.full_name || '–')}</a>${p.role === 'admin' ? ' <span class="chip pri">admin</span>' : ''}</td>
           <td>${esc(p.email)}</td><td class="n">${s.answered}</td><td class="n">${pct(s.correct, s.attempts)}</td><td class="n">${mocks.length}</td>
           <td class="n">${mocks.length ? pct(mocks[mocks.length - 1].correct, mocks[mocks.length - 1].answered) : '–'}</td>
-          <td>${fmtDate(last)}</td>${events ? (() => {
+          <td><div data-presence="${p.id}"></div><span class="small">${fmtDate(last)}</span></td>${events ? (() => {
             const mine = events.filter((e) => e.user_id === p.id); const lastIn = mine.find((e) => e.event === 'login'); const fl = sharingFlags(mine);
             return `<td>${lastIn ? `${esc(lastIn.device || '')}${lastIn.country ? ' · ' + esc(lastIn.country) : ''}<br><span class="muted small">${fmtDate(lastIn.at)}</span>` : '<span class="muted">–</span>'}${fl.length ? `<br><span class="chip bad" title="${esc(fl.join(' · '))}">${icon('alert')}Possible sharing</span>` : ''}</td>`;
-          })() : ''}<td>${p.active ? '<span class="chip ok">Active</span>' : '<span class="chip">Disabled</span>'}${'notice_version' in p && p.notice_version < NOTICE_VERSION ? '<br><span class="chip warn">Notice not accepted</span>' : ''}</td></tr>`;
+          })() : ''}<td>${p.active ? '<span class="chip ok">Enabled</span>' : '<span class="chip">Disabled</span>'}${'notice_version' in p && p.notice_version < NOTICE_VERSION ? '<br><span class="chip warn">Notice not accepted</span>' : ''}</td></tr>`;
       }).join('')}</tbody></table></div></section>`;
+
+  paintPresence(view, presence);
+  clearInterval(state.presenceTimer);
+  state.presenceTimer = setInterval(async () => {
+    const table = view.querySelector('[data-presence]');
+    if (!table || !table.isConnected || document.hidden) { if (!table || !table.isConnected) clearInterval(state.presenceTimer); return; }
+    paintPresence(view, await loadPresence());
+  }, 60000);
 
   const form = view.querySelector('#addForm');
   view.querySelector('#showAdd').onclick = () => { form.hidden = false; form.name.focus(); };
