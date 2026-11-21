@@ -425,3 +425,18 @@ ul.flags li { padding: 10px 12px; border: 1px solid var(--line); border-left: 3p
 .cd-quote svg.i { flex: none; margin-top: 2px; color: var(--primary); }
 .modal.countdown { max-width: 600px; }
 .modal.countdown .btn-row { margin-top: var(--space-4); justify-content: flex-end; }
+
+/* Notifications bell + report replies */
+.bell { position: relative; min-width: 44px; min-height: 44px; padding: 0 10px; }
+.bell .nbadge { position: absolute; top: 2px; right: 0; min-width: 18px; height: 18px; font-size: .7rem; padding: 0 5px; }
+.bell .nbadge[hidden] { display: none; }
+.modal.notif { max-width: 560px; }
+.notif-list { list-style: none; margin: 0; padding: 0; display: grid; gap: var(--space-3); }
+.notif-item { border: 1px solid var(--line); border-radius: var(--radius-sm); padding: var(--space-3); background: var(--surface); }
+.rep-reply { margin-top: var(--space-2); padding: 8px 12px; border-left: 3px solid var(--primary); background: var(--primary-soft); border-radius: var(--radius-sm); }
+.rep-reply p { margin: 4px 0 0; white-space: pre-wrap; color: var(--text-strong); }
+.rep-form { margin-top: var(--space-3); padding: var(--space-3); border: 1px dashed var(--line); border-radius: var(--radius-sm); }
+.rep-form fieldset { border: 0; padding: 0; margin: var(--space-2) 0; }
+.rep-form legend { font-weight: 600; margin-bottom: 6px; }
+label.radio { display: inline-flex; align-items: center; gap: 6px; min-height: 40px; padding: 0 12px; border: 1px solid var(--line); border-radius: 999px; cursor: pointer; }
+label.radio:has(input:checked) { border-color: var(--primary); background: var(--primary-soft); color: var(--primary); font-weight: 600; }

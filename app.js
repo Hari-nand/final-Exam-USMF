@@ -145,6 +145,7 @@ function download(filename, text, type = 'application/json') {
 
 /* Lucide-style SVG icons (one stroke style everywhere, no emoji) */
 const ICONS = {
+  bell: '<path d="M6 8a6 6 0 0 1 12 0c0 7 3 9 3 9H3s3-2 3-9"/><path d="M10.3 21a1.94 1.94 0 0 0 3.4 0"/>',
   home: '<path d="M3 10.5 12 3l9 7.5"/><path d="M5 9.5V21h5v-6h4v6h5V9.5"/>',
   book: '<path d="M2 4h6a4 4 0 0 1 4 4v13a3 3 0 0 0-3-3H2z"/><path d="M22 4h-6a4 4 0 0 0-4 4v13a3 3 0 0 1 3-3h7z"/>',
   exam: '<rect x="8" y="2" width="8" height="4" rx="1"/><path d="M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2"/><path d="m9 14 2 2 4-4"/>',
@@ -426,6 +427,7 @@ function shell(active, inner) {
         <a class="brand" href="#/home"><span class="mark">${icon('check')}</span>${esc(APP_NAME)}</a>
         <nav class="nav" aria-label="Main">${items.map(link).join('')}</nav>
         <div class="me">
+          <button class="btn ghost sm bell" id="bellBtn" type="button" aria-label="Notifications" aria-haspopup="dialog">${icon('bell')}<span class="nbadge" hidden></span></button>
           <a class="who" href="#/account" ${active === 'account' ? 'aria-current="page"' : ''} title="Account">${icon('user')}<span>${esc(p.full_name || p.email)}</span></a>
           <button class="btn ghost sm" id="signOut">${icon('logout')}<span class="sr">Sign out</span></button>
         </div>
@@ -434,6 +436,8 @@ function shell(active, inner) {
     <main id="view" tabindex="-1">${inner}</main>
     <nav class="bottom-nav" aria-label="Main">${items.map(link).join('')}</nav>`;
   document.getElementById('signOut').onclick = () => signOutNow();
+  document.getElementById('bellBtn').onclick = () => openNotifications();
+  paintBell();
   if (p.role === 'admin') paintReportBadge();
   return document.getElementById('view');
 }
@@ -1071,11 +1075,12 @@ document.addEventListener('click', (e) => {
   openReport(+b.dataset.report, (b.dataset.order || '').split(',').filter((x) => x !== '').map(Number));
 });
 
+const ACTIVE_REPORT = ['open', 'in_review'];
 const reportCache = { n: 0, at: 0 };
 async function openReportCount(force = false) {
   if (state.profile?.role !== 'admin') return 0;
   if (!force && Date.now() - reportCache.at < 60000) return reportCache.n;
-  const { count, error } = await sb.from('question_reports').select('id', { count: 'exact', head: true }).eq('status', 'open');
+  const { count, error } = await sb.from('question_reports').select('id', { count: 'exact', head: true }).in('status', ACTIVE_REPORT);
   if (error) { if (!missingInDb(error)) console.warn(error); return 0; }
   reportCache.n = count || 0; reportCache.at = Date.now();
   return reportCache.n;
@@ -1095,14 +1100,14 @@ const reportsHomeCard = (n) => `<section class="card update" aria-labelledby="rp
 
 /* ---------- Admin: reports ---------- */
 
-const REPORT_STATUS = { open: ['Open', 'warn'], fixed: ['Fixed', 'ok'], no_change: ['No change needed', ''] };
+const REPORT_STATUS = { open: ['New', 'warn'], in_review: ['Under review', 'pri'], fixed: ['Closed: fixed', 'ok'], no_change: ['Closed: no change needed', ''] };
 
 async function renderAdminReports() {
   const view = shell('admin', loading);
   const meta = await loadMeta(true);
   const ui = state.rui || (state.rui = { status: 'open' });
-  let q = sb.from('question_reports').select('id,question_id,user_id,comment,shown_order,status,admin_note,created_at,resolved_at').order('created_at', { ascending: false }).limit(500);
-  if (ui.status === 'open') q = q.eq('status', 'open'); else if (ui.status === 'done') q = q.neq('status', 'open');
+  let q = sb.from('question_reports').select('id,question_id,user_id,comment,shown_order,status,admin_note,admin_reply,replied_at,created_at,resolved_at').order('created_at', { ascending: false }).limit(500);
+  if (ui.status === 'open') q = q.in('status', ACTIVE_REPORT); else if (ui.status === 'done') q = q.in('status', ['fixed', 'no_change']);
   const { data: reps, error } = await q;
   if (error) {
     if (missingInDb(error)) { view.innerHTML = adminTabs('reports') + `<section class="card"><h2>${icon('alert')} Reports aren't switched on yet</h2><p class="muted">Run <code>supabase/migration_006_notices_reports.sql</code> in the Supabase SQL Editor, then reload.</p></section>`; return; }
@@ -1115,6 +1120,12 @@ async function renderAdminReports() {
     uids.length ? inChunks(uids, 100, (c) => fetchAll(() => sb.from('profiles').select('id,full_name,email').in('id', c))) : [],
   ]);
   const qById = new Map(qs.map((x) => [x.id, x])); const who = new Map(people.map((p) => [p.id, p.full_name || p.email]));
+  // Read receipts: the newest notification per report
+  const seen = new Map();
+  if (reps.length) {
+    const ns = await inChunks(reps.map((r) => r.id), 100, (c) => fetchAll(() => sb.from('notifications').select('report_id,created_at,seen_at').in('report_id', c).order('created_at', { ascending: false }))).catch(() => []);
+    ns.forEach((n) => { if (!seen.has(n.report_id)) seen.set(n.report_id, n); });
+  }
   const groups = qids.map((id) => ({ q: qById.get(id), id, reps: reps.filter((r) => r.question_id === id) }));
   const nOpen = await openReportCount(true);
 
@@ -1123,11 +1134,15 @@ async function renderAdminReports() {
       <div class="row-between"><span><b>${esc(who.get(r.user_id) || 'Learner')}</b> <span class="muted small">${esc(fmtDate(r.created_at))}</span></span><span class="chip ${REPORT_STATUS[r.status][1]}">${REPORT_STATUS[r.status][0]}</span></div>
       <p class="rep-comment">${esc(r.comment)}</p>
       ${seenAs(r.shown_order, q) ? `<p class="muted small" style="margin:0">Their letters → letters below: ${esc(seenAs(r.shown_order, q))}</p>` : ''}
-      ${r.admin_note ? `<p class="small" style="margin:6px 0 0">${icon('check')} ${esc(r.admin_note)}</p>` : ''}
+      ${r.admin_note ? `<p class="small muted" style="margin:6px 0 0">Your note (admin only): ${esc(r.admin_note)}</p>` : ''}
+      ${r.admin_reply ? `<div class="rep-reply"><span class="small muted">Your reply · ${esc(fmtDate(r.replied_at))}</span><p>${esc(r.admin_reply)}</p></div>` : ''}
+      ${seen.get(r.id) ? `<p class="small muted" style="margin:4px 0 0">${icon('eye')} ${seen.get(r.id).seen_at ? `Seen by ${esc(who.get(r.user_id) || 'the learner')} · ${esc(fmtDate(seen.get(r.id).seen_at))}` : 'Notification not seen yet'}</p>` : ''}
+      <div class="btn-row" style="margin-top:8px"><button class="btn sm" type="button" data-reply="${r.id}">${icon('right')}${r.admin_reply ? 'Edit reply or status' : 'Reply / change status'}</button></div>
+      <div class="rep-form" data-form="${r.id}" hidden></div>
     </li>`;
   const groupCard = (g) => {
     const q = g.q; const topic = q && meta.topicById.get(q.category_id); const disc = topic && meta.discById.get(topic.discipline_id);
-    const open = g.reps.filter((r) => r.status === 'open').length;
+    const open = g.reps.filter((r) => ACTIVE_REPORT.includes(r.status)).length;
     return `<li class="card rgroup" data-q="${g.id}">
       ${q ? `<div class="qmeta">${disc ? `<span class="chip pri">${esc(disc.name)}</span>` : ''}${topic && topic.name !== disc?.name ? `<span class="chip">${esc(topic.name)}</span>` : ''}<span class="chip">${q.qtype}</span><span class="chip">#${q.id}</span>${q.active ? '' : '<span class="chip warn">hidden</span>'}</div>
       <p class="rq" style="font-weight:600">${esc(q.question)}</p>
@@ -1137,15 +1152,16 @@ async function renderAdminReports() {
       <ul class="reps">${g.reps.map((r) => repLine(r, q)).join('')}</ul>
       <div class="qedit"></div>
       ${open ? `<div class="resolve">
-        <label class="field" style="margin:12px 0 8px">Note to keep with the report<span class="help">Optional, e.g. what you changed.</span><input type="text" maxlength="300" class="rnote"></label>
-        <div class="btn-row">${q ? `<button class="btn" data-act="edit">${icon('layers')}Edit question</button>` : ''}<button class="btn primary" data-act="fixed">${icon('check')}Mark fixed</button><button class="btn ghost" data-act="no_change">No change needed</button></div></div>` : ''}
+        <label class="field" style="margin:12px 0 8px">Note to keep with the reports<span class="help">Admin only, e.g. what you changed. To answer a learner, use Reply on their report.</span><input type="text" maxlength="300" class="rnote"></label>
+        <div class="btn-row">${q ? `<button class="btn" data-act="edit">${icon('layers')}Edit question</button>` : ''}<button class="btn primary" data-act="fixed">${icon('check')}Close all as fixed</button><button class="btn ghost" data-act="no_change">Close all: no change needed</button></div>
+        <p class="muted small" style="margin:6px 0 0">Closing notifies each learner who reported this question.</p></div>` : ''}
     </li>`;
   };
 
   view.innerHTML = `${adminTabs('reports')}
     <div class="row-between"><h1 style="margin:0">Question reports</h1>
-      <div class="seg" role="group" aria-label="Show">${[['open', `Open (${nOpen})`], ['done', 'Done'], ['all', 'All']].map(([k, l]) => `<button class="btn sm ${ui.status === k ? 'primary' : 'ghost'}" data-status="${k}" aria-pressed="${ui.status === k}">${l}</button>`).join('')}</div></div>
-    <p class="muted">Learners report questions they think are wrong. Check the question against the university file. Edit it if needed, then mark the reports as fixed or as no change needed. Past answers are not re-scored.</p>
+      <div class="seg" role="group" aria-label="Show">${[['open', `Active (${nOpen})`], ['done', 'Closed'], ['all', 'All']].map(([k, l]) => `<button class="btn sm ${ui.status === k ? 'primary' : 'ghost'}" data-status="${k}" aria-pressed="${ui.status === k}">${l}</button>`).join('')}</div></div>
+    <p class="muted">Learners report questions they think are wrong. Check the question against the university file and edit it if needed. Reply to each learner and set the report to Under review or Closed: they get a notification. Past answers are not re-scored.</p>
     ${groups.length ? `<ol class="rlist">${groups.map(groupCard).join('')}</ol>` : `<div class="card empty">${icon('check')}<h2>${ui.status === 'open' ? 'No open reports' : 'Nothing here'}</h2><p class="muted">${ui.status === 'open' ? 'When a learner reports a question, it shows up here.' : ''}</p></div>`}`;
   paintReportBadge();
 
@@ -1160,12 +1176,114 @@ async function renderAdminReports() {
       b.disabled = true;
       const note = card.querySelector('.rnote')?.value.trim() || null;
       try {
-        check(await sb.from('question_reports').update({ status: b.dataset.act, admin_note: note, resolved_at: new Date().toISOString(), resolved_by: state.profile.id }).eq('question_id', id).eq('status', 'open'));
-        toast(b.dataset.act === 'fixed' ? 'Marked as fixed.' : 'Marked as no change needed.', 'ok');
+        check(await sb.from('question_reports').update({ status: b.dataset.act, admin_note: note, resolved_at: new Date().toISOString(), resolved_by: state.profile.id }).eq('question_id', id).in('status', ACTIVE_REPORT));
+        toast(b.dataset.act === 'fixed' ? 'Closed as fixed. Reporters were notified.' : 'Closed as no change needed. Reporters were notified.', 'ok');
         reportCache.at = 0; renderAdminReports();
       } catch (err) { b.disabled = false; toast(errMsg(err), 'bad'); }
     }));
   });
+
+  // Per-report reply + status (works for any report, new or old)
+  view.querySelectorAll('[data-reply]').forEach((b) => (b.onclick = () => {
+    const r = reps.find((x) => x.id === +b.dataset.reply); const box = view.querySelector(`[data-form="${r.id}"]`);
+    if (!box.hidden) { box.hidden = true; return; }
+    const next = r.status === 'open' ? 'in_review' : r.status;
+    box.innerHTML = `<form novalidate>
+        <label class="field">Reply to ${esc(who.get(r.user_id) || 'the learner')}<span class="help">They see this in their notifications. Optional when you only change the status.</span>
+          <textarea name="reply" rows="3" maxlength="1000" placeholder="For example: Thanks, you were right. Option C was cut off and is now fixed.">${esc(r.admin_reply || '')}</textarea></label>
+        <fieldset class="field"><legend>Status</legend><div class="btn-row">
+          ${[['in_review', 'Under review'], ['fixed', 'Closed: fixed'], ['no_change', 'Closed: no change needed']].map(([k, l]) => `<label class="radio"><input type="radio" name="st" value="${k}" ${next === k ? 'checked' : ''}> ${l}</label>`).join('')}
+        </div></fieldset>
+        <div class="btn-row"><button class="btn primary" type="submit">${icon('check')}Send to learner</button><button class="btn ghost" type="button" data-cancel>Cancel</button></div>
+        <p class="form-error" role="alert"></p></form>`;
+    box.hidden = false;
+    const f = box.querySelector('form'); f.reply.focus();
+    f.querySelector('[data-cancel]').onclick = () => { box.hidden = true; };
+    f.onsubmit = async (e) => {
+      e.preventDefault();
+      const reply = f.reply.value.trim(); const status = f.st.value;
+      if (reply === (r.admin_reply || '') && status === r.status) { f.querySelector('.form-error').textContent = 'Write a reply or choose a different status.'; return; }
+      const btn = f.querySelector('[type=submit]'); btn.disabled = true;
+      try {
+        check(await sb.from('question_reports').update({ admin_reply: reply || null, status }).eq('id', r.id));
+        toast(`Sent to ${who.get(r.user_id) || 'the learner'}.`, 'ok');
+        reportCache.at = 0; renderAdminReports();
+      } catch (err) { btn.disabled = false; f.querySelector('.form-error').textContent = errMsg(err); }
+    };
+  }));
+}
+
+/* ---------- Notifications (bell) ---------- */
+
+const bellCache = { n: 0, at: 0 };
+async function unseenCount(force = false) {
+  if (!force && Date.now() - bellCache.at < 60000) return bellCache.n;
+  const { count, error } = await sb.from('notifications').select('id', { count: 'exact', head: true }).is('seen_at', null).eq('user_id', state.profile.id);
+  if (error) { if (!missingInDb(error)) console.warn(error); return 0; }
+  bellCache.n = count || 0; bellCache.at = Date.now();
+  return bellCache.n;
+}
+async function paintBell(force = false) {
+  const n = state.profile ? await unseenCount(force) : 0;
+  const b = document.getElementById('bellBtn'); if (!b) return;
+  const badge = b.querySelector('.nbadge');
+  badge.hidden = !n; badge.textContent = n > 99 ? '99+' : String(n);
+  b.setAttribute('aria-label', n ? `Notifications, ${n} new` : 'Notifications');
+}
+const NOTE_TEXT = {
+  in_review: 'The admin is checking your report.',
+  fixed: 'Your report was checked and the question was corrected.',
+  no_change: 'Your report was checked. The question matches the university file, so it stays as it is.',
+  open: 'Your report is waiting to be checked.',
+};
+async function openNotifications() {
+  document.querySelector('.modal-back')?.remove();
+  const back = document.createElement('div');
+  back.className = 'modal-back';
+  back.innerHTML = `<div class="card modal notif" role="dialog" aria-modal="true" aria-labelledby="ntH">
+      <div class="row-between"><h2 id="ntH" style="margin:0">${icon('bell')}Notifications</h2><button class="btn ghost sm" type="button" data-close aria-label="Close">${icon('x')}</button></div>
+      <div class="notif-body">${loading}</div></div>`;
+  document.body.appendChild(back);
+  const opener = document.activeElement;
+  const close = () => { back.remove(); document.removeEventListener('keydown', onKey, true); if (opener && opener.isConnected) opener.focus({ preventScroll: true }); };
+  const onKey = (e) => { if (e.key === 'Escape') { e.preventDefault(); close(); } };
+  document.addEventListener('keydown', onKey, true);
+  back.addEventListener('mousedown', (e) => { if (e.target === back) close(); });
+  back.querySelector('[data-close]').onclick = close; back.querySelector('[data-close]').focus();
+  const body = back.querySelector('.notif-body');
+  try {
+    const { data, error } = await sb.from('notifications')
+      .select('id,created_at,report_id,question_reports(id,question_id,comment,status,admin_reply)')
+      .eq('user_id', state.profile.id).is('seen_at', null).order('created_at', { ascending: false }).limit(50);
+    if (error) throw error;
+    const items = (data || []).filter((n) => n.question_reports);
+    if (!items.length) {
+      body.innerHTML = `<div class="empty" style="padding:24px 8px">${icon('check')}<p class="muted" style="margin:8px 0 0">No new notifications. When the admin answers one of your question reports, it shows up here.</p></div>`;
+    } else {
+      const qs = await fetchQuestions([...new Set(items.map((n) => n.question_reports.question_id))]).catch(() => []);
+      const qById = new Map(qs.map((q) => [q.id, q]));
+      body.innerHTML = `<p class="muted small" style="margin:8px 0 12px">These disappear once you close this panel.</p><ul class="notif-list">${items.map((n) => {
+        const r = n.question_reports; const q = qById.get(r.question_id); const [label, cls] = REPORT_STATUS[r.status] || [r.status, ''];
+        return `<li class="notif-item">
+          <div class="row-between"><b>Your question report</b><span class="chip ${cls}">${esc(label)}</span></div>
+          ${q ? `<p class="small muted" style="margin:6px 0 0">${esc(q.question.length > 160 ? q.question.slice(0, 160) + '…' : q.question)}</p>` : ''}
+          <p class="small" style="margin:8px 0 0">${esc(NOTE_TEXT[r.status] || '')}</p>
+          ${r.admin_reply ? `<div class="rep-reply"><span class="small muted">Reply from the admin</span><p>${esc(r.admin_reply)}</p></div>` : ''}
+          <p class="small muted" style="margin:8px 0 0">You wrote: "${esc(r.comment.length > 140 ? r.comment.slice(0, 140) + '…' : r.comment)}" · ${esc(fmtDate(n.created_at))}</p>
+          ${q ? `<div class="btn-row" style="margin-top:8px"><button class="btn sm" type="button" data-try="${q.id}">${icon('book')}Practice this question</button></div>` : ''}
+        </li>`; }).join('')}</ul>`;
+      body.querySelectorAll('[data-try]').forEach((b) => (b.onclick = async () => {
+        b.disabled = true; const q = qById.get(+b.dataset.try);
+        try { close(); await startTutor([q], 'Reported question', null); } catch (e) { toast(errMsg(e), 'bad'); }
+      }));
+      // Viewed: mark them seen so they leave the panel next time
+      const { error: e2 } = await sb.from('notifications').update({ seen_at: new Date().toISOString() }).in('id', items.map((n) => n.id));
+      if (e2) console.warn(e2);
+    }
+  } catch (e) {
+    body.innerHTML = missingInDb(e) ? `<p class="muted" style="margin:12px 0 0">Notifications aren't switched on yet.</p>` : `<p class="form-error" style="margin:12px 0 0">${esc(errMsg(e))}</p>`;
+  }
+  bellCache.at = 0; paintBell(true);
 }
 
 /* =========================================================================
