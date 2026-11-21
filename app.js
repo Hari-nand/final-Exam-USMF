@@ -468,6 +468,8 @@ const routes = {
   'admin/questions': renderAdminQuestions,
   'admin/security': renderAdminSecurity,
   'admin/reports': renderAdminReports,
+  'admin/notices': renderAdminNotices,
+  'admin/insights': renderAdminInsights,
 };
 
 let lastRoute = '';
@@ -564,13 +566,15 @@ async function loadAnnouncements() {
   const { data, error } = await sb.from('announcements').select('id,title,intro,items,issuer,show_from,show_until').order('show_from', { ascending: false });
   if (error) { if (!missingInDb(error)) console.warn(error); return []; }
   const now = Date.now();
+  const reads = await sb.from('notice_reads').select('announcement_id').eq('user_id', state.profile.id);
+  state.noticeReads = new Set(reads.error ? [] : reads.data.map((r) => r.announcement_id));
   return (data || []).filter((a) => Date.parse(a.show_from) <= now && (!a.show_until || Date.parse(a.show_until) > now));
 }
 const longDate = (ts) => new Date(ts).toLocaleDateString('en-GB', { day: 'numeric', month: 'long', year: 'numeric' });
 const updatesKey = () => 'mcq-updates-seen:' + (state.profile ? state.profile.id : '');
 function updateCards(list) {
   const seen = store.get(updatesKey()) || [];
-  return list.filter((u) => !seen.includes(u.id)).map((u) => `
+  return list.filter((u) => !seen.includes(u.id) && !state.noticeReads?.has(u.id)).map((u) => `
     <section class="card update" data-update="${esc(u.id)}" aria-labelledby="up-${esc(u.id)}">
       <div class="row-between"><h2 id="up-${esc(u.id)}">${icon('shield')}${esc(u.title)}</h2><span class="muted small">${esc(longDate(u.show_from))}</span></div>
       ${u.intro ? `<p class="muted">${esc(u.intro)}</p>` : ''}
@@ -583,6 +587,8 @@ function wireUpdates(root) {
     const seen = store.get(updatesKey()) || [];
     if (!seen.includes(b.dataset.dismissUpdate)) seen.push(b.dataset.dismissUpdate);
     store.set(updatesKey(), seen);
+    state.noticeReads?.add(b.dataset.dismissUpdate);
+    sb.from('notice_reads').upsert({ announcement_id: b.dataset.dismissUpdate, user_id: state.profile.id }, { onConflict: 'announcement_id,user_id', ignoreDuplicates: true }).then(({ error }) => { if (error && !missingInDb(error)) console.warn(error); });
     b.closest('.update')?.remove();
   }));
 }
@@ -812,6 +818,8 @@ async function renderPractice() {
     <div class="page-head"><div><h1>Create a test</h1><p class="muted">Work through a subject one pass at a time: unused questions first, then your incorrect ones, then mixed blocks. Answers are marked against the official key.</p></div></div>
 
     ${practiceDraftInfo() ? practiceResumeCard(practiceDraftInfo()) : ''}
+    <div class="card tight row-between"><div class="row">${icon('alert')}<div><b>Most missed by the group</b><br><span class="muted small">Up to 20 questions most learners got wrong on their first try. No names or scores are shared.</span></div></div>
+      <button class="btn" type="button" id="mostMissed">${icon('right')}Start</button></div>
 
     <section class="card" aria-labelledby="tm">
       <fieldset><legend id="tm">Test mode</legend>
@@ -865,6 +873,16 @@ async function renderPractice() {
       <button class="btn primary lg" id="start">Create test ${icon('right')}</button>
     </div></div>`;
   wirePracticeResume(view, renderPractice);
+  view.querySelector('#mostMissed').onclick = async (e) => {
+    const b = e.currentTarget; b.disabled = true;
+    try {
+      const { data, error } = await sb.rpc('most_missed_ids', { p_limit: 20 });
+      if (error) throw error;
+      const qs = await fetchQuestions((data || []).map(Number));
+      if (!qs.length) { toast('Not enough answers from the group yet. Try again later.', ''); b.disabled = false; return; }
+      await startTutor(shuffle(qs), 'Most missed by the group', null);
+    } catch (err) { toast(errMsg(err), 'bad'); b.disabled = false; }
+  };
 
   const topicBoxes = [...view.querySelectorAll('.topic input')];
   const discBoxes = [...view.querySelectorAll('[data-discall]')];
@@ -2039,7 +2057,193 @@ const adminTabs = (active) => `<nav class="tabs" aria-label="Admin sections">
   <a href="#/admin/learners" ${active === 'learners' ? 'aria-current="page"' : ''}>${icon('user')}Learners</a>
   <a href="#/admin/questions" ${active === 'questions' ? 'aria-current="page"' : ''}>${icon('layers')}Questions &amp; blueprint</a>
   <a href="#/admin/reports" ${active === 'reports' ? 'aria-current="page"' : ''}>${icon('alert')}Reports <span class="tbadge" data-tab-badge>${reportCache.n || ''}</span></a>
+  <a href="#/admin/notices" ${active === 'notices' ? 'aria-current="page"' : ''}>${icon('flag')}Notices</a>
+  <a href="#/admin/insights" ${active === 'insights' ? 'aria-current="page"' : ''}>${icon('trend')}Insights</a>
   <a href="#/admin/security" ${active === 'security' ? 'aria-current="page"' : ''}>${icon('shield')}Security</a></nav>`;
+
+/* ---------- Admin: notices ---------- */
+
+const NOTICE_ICONS = [['check', 'Tick'], ['alert', 'Alert'], ['flag', 'Flag'], ['bell', 'Bell'], ['clock', 'Clock'], ['layers', 'Layers'], ['target', 'Target'], ['trend', 'Chart'], ['book', 'Book'], ['retry', 'Repeat'], ['shield', 'Shield'], ['exam', 'Exam']];
+const absDate = (ts) => new Date(ts).toLocaleString('en-GB', { day: 'numeric', month: 'short', year: 'numeric', hour: '2-digit', minute: '2-digit' });
+const toLocalInput = (ts) => { const d = new Date(ts); d.setMinutes(d.getMinutes() - d.getTimezoneOffset()); return d.toISOString().slice(0, 16); };
+const noticeStatus = (a) => { const now = Date.now(); if (Date.parse(a.show_from) > now) return ['Scheduled', 'pri']; if (a.show_until && Date.parse(a.show_until) <= now) return ['Ended', '']; return ['Live', 'ok']; };
+
+async function renderAdminNotices() {
+  const view = shell('admin', loading);
+  const [{ data: list, error }, reads, people] = await Promise.all([
+    sb.from('announcements').select('id,title,intro,items,issuer,show_from,show_until,created_at').order('show_from', { ascending: false }),
+    sb.from('notice_reads').select('announcement_id,user_id'),
+    sb.from('profiles').select('id,full_name,email,role,active'),
+  ]);
+  if (error) throw error;
+  const learners = (people.data || []).filter((p) => p.active && p.role !== 'admin');
+  const readsBy = new Map(); for (const r of reads.data || []) { if (!readsBy.has(r.announcement_id)) readsBy.set(r.announcement_id, new Set()); readsBy.get(r.announcement_id).add(r.user_id); }
+  view.innerHTML = `${adminTabs('notices')}
+    <div class="row-between"><h1 style="margin:0">Notices</h1><button class="btn primary" id="newNotice">+ New notice</button></div>
+    <p class="muted">Notices show on every learner's Home page between their start and end time, until each learner taps "Got it".</p>
+    <div id="noticeEditor"></div>
+    <section class="card"><div class="table-wrap"><table><thead><tr><th>Notice</th><th>Status</th><th>Shown</th><th class="n">Read</th><th></th></tr></thead><tbody>
+    ${list.map((a) => { const [st, cls] = noticeStatus(a); const r = readsBy.get(a.id) || new Set(); const nRead = learners.filter((l) => r.has(l.id)).length;
+      return `<tr><td><b>${esc(a.title)}</b>${a.intro ? `<br><span class="muted small">${esc(a.intro.length > 90 ? a.intro.slice(0, 90) + '…' : a.intro)}</span>` : ''}</td>
+        <td><span class="chip ${cls}">${st}</span></td>
+        <td class="small">${esc(absDate(a.show_from))}<br><span class="muted">${a.show_until ? 'until ' + esc(absDate(a.show_until)) : 'no end date'}</span></td>
+        <td class="n"><span title="${esc(learners.filter((l) => r.has(l.id)).map((l) => l.full_name || l.email).join(', ') || 'Nobody yet')}">${nRead}/${learners.length}</span></td>
+        <td><div class="btn-row" style="justify-content:flex-end"><button class="btn sm" data-edit-notice="${esc(a.id)}">Edit</button>${st === 'Ended' ? '' : `<button class="btn sm ghost" data-end-notice="${esc(a.id)}">End now</button>`}<button class="btn sm danger" data-del-notice="${esc(a.id)}">Delete</button></div></td></tr>`; }).join('') || '<tr><td colspan="5" class="muted">No notices yet.</td></tr>'}
+    </tbody></table></div><p class="muted small" style="margin:8px 0 0">Read = learners who tapped "Got it" (hover to see who). Taps from before 22 Nov were only saved on each device, so older notices show fewer reads.</p></section>`;
+  const open = (a) => noticeEditor(view.querySelector('#noticeEditor'), a);
+  view.querySelector('#newNotice').onclick = () => open(null);
+  view.querySelectorAll('[data-edit-notice]').forEach((b) => (b.onclick = () => open(list.find((x) => x.id === b.dataset.editNotice))));
+  view.querySelectorAll('[data-end-notice]').forEach((b) => (b.onclick = async () => {
+    if (!confirm('End this notice now? It disappears from Home for everyone.')) return;
+    try { check(await sb.from('announcements').update({ show_until: new Date().toISOString() }).eq('id', b.dataset.endNotice)); toast('Notice ended.', 'ok'); renderAdminNotices(); } catch (e) { toast(errMsg(e), 'bad'); }
+  }));
+  view.querySelectorAll('[data-del-notice]').forEach((b) => (b.onclick = async () => {
+    if (!confirm('Delete this notice for good? Its read counts are deleted too.')) return;
+    try { check(await sb.from('announcements').delete().eq('id', b.dataset.delNotice)); toast('Notice deleted.', 'ok'); renderAdminNotices(); } catch (e) { toast(errMsg(e), 'bad'); }
+  }));
+}
+
+function noticeEditor(box, a) {
+  const isNew = !a;
+  const items = a && Array.isArray(a.items) && a.items.length ? a.items.map((x) => [...x]) : [['check', '', '']];
+  const until = a ? a.show_until : new Date(Date.now() + 14 * 864e5).toISOString();
+  box.innerHTML = `<form class="card" style="border-color:var(--primary)" novalidate>
+    <h2>${isNew ? 'New notice' : 'Edit notice'}</h2>
+    <label class="field">Title<input name="title" maxlength="120" required value="${esc(a?.title || '')}" placeholder="For example: Question corrected"></label>
+    <label class="field">Short introduction<span class="help">Optional, one or two sentences.</span><textarea name="intro" rows="2" maxlength="400">${esc(a?.intro || '')}</textarea></label>
+    <fieldset class="field"><legend>Points</legend><div id="nItems"></div><button type="button" class="btn sm" id="addItem">+ Add point</button></fieldset>
+    <div class="grid two">
+      <label class="field">Show from<input type="datetime-local" name="from" required value="${toLocalInput(a ? a.show_from : Date.now())}"></label>
+      <label class="field">Show until<span class="help">Leave empty for no end date.</span><input type="datetime-local" name="until" value="${until ? toLocalInput(until) : ''}"></label>
+    </div>
+    <label class="field">Issued by<input name="issuer" maxlength="60" value="${esc(a?.issuer || 'ANYMS')}"></label>
+    <h3 class="small muted" style="margin:16px 0 8px">Preview</h3><div id="nPreview"></div>
+    <div class="btn-row"><button class="btn primary" type="submit">${icon('check')}${isNew ? 'Publish' : 'Save changes'}</button><button class="btn ghost" type="button" id="nCancel">Cancel</button></div>
+    ${!isNew ? '<p class="muted small">Learners who already tapped "Got it" will not see the edited version again. To show it to everyone again, end this notice and publish a new one.</p>' : ''}
+    <p class="form-error" role="alert"></p></form>`;
+  const f = box.querySelector('form');
+  const drawItems = () => {
+    f.querySelector('#nItems').innerHTML = items.map(([ic, t, d], i) => `<div class="nitem" data-i="${i}">
+      <select aria-label="Icon" data-k="0">${NOTICE_ICONS.map(([k, l]) => `<option value="${k}" ${k === ic ? 'selected' : ''}>${l}</option>`).join('')}</select>
+      <input data-k="1" maxlength="80" placeholder="Heading" value="${esc(t)}" aria-label="Point heading">
+      <textarea data-k="2" rows="2" maxlength="500" placeholder="Text" aria-label="Point text">${esc(d)}</textarea>
+      <button type="button" class="btn sm ghost" data-rm="${i}" aria-label="Remove point">${icon('x')}</button></div>`).join('');
+    f.querySelectorAll('.nitem [data-k]').forEach((el) => (el.oninput = el.onchange = () => { items[+el.closest('.nitem').dataset.i][+el.dataset.k] = el.value; preview(); }));
+    f.querySelectorAll('[data-rm]').forEach((b) => (b.onclick = () => { items.splice(+b.dataset.rm, 1); drawItems(); preview(); }));
+  };
+  const current = () => ({ id: a?.id || 'notice', title: f.title.value.trim(), intro: f.intro.value.trim() || null, issuer: f.issuer.value.trim() || 'ANYMS',
+    items: items.filter(([, t, d]) => t.trim() || d.trim()).map(([ic, t, d]) => [ic, t.trim(), d.trim()]),
+    show_from: f.from.value ? new Date(f.from.value).toISOString() : new Date().toISOString(), show_until: f.until.value ? new Date(f.until.value).toISOString() : null });
+  const preview = () => {
+    const html = updateCards.call(null, [{ ...current(), title: current().title || 'Title' }]);
+    f.querySelector('#nPreview').innerHTML = html.replace(/data-dismiss-update="[^"]*"/, 'disabled');
+  };
+  drawItems(); preview();
+  ['title', 'intro', 'issuer', 'from', 'until'].forEach((k) => (f[k].oninput = preview));
+  f.querySelector('#addItem').onclick = () => { items.push(['check', '', '']); drawItems(); preview(); };
+  f.querySelector('#nCancel').onclick = () => (box.innerHTML = '');
+  f.onsubmit = async (e) => {
+    e.preventDefault();
+    const err = f.querySelector('.form-error'); const row = current();
+    if (!row.title) { err.textContent = 'Write a title.'; f.title.focus(); return; }
+    if (row.show_until && Date.parse(row.show_until) <= Date.parse(row.show_from)) { err.textContent = 'The end time must be after the start time.'; return; }
+    const btn = f.querySelector('[type=submit]'); btn.disabled = true;
+    try {
+      if (isNew) { row.id = `${row.title.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 40) || 'notice'}-${Date.now().toString(36)}`; check(await sb.from('announcements').insert(row)); }
+      else { delete row.id; check(await sb.from('announcements').update(row).eq('id', a.id)); }
+      toast(isNew ? (Date.parse(row.show_from) > Date.now() ? 'Notice scheduled.' : 'Notice published.') : 'Notice saved.', 'ok'); renderAdminNotices();
+    } catch (e2) { btn.disabled = false; err.textContent = errMsg(e2); }
+  };
+  box.scrollIntoView({ block: 'start' }); f.title.focus({ preventScroll: true });
+}
+
+/* ---------- Admin: insights ---------- */
+
+async function renderAdminInsights() {
+  const view = shell('admin', loading);
+  const [meta, ov, stats, people, mockRows, missed] = await Promise.all([
+    loadMeta(),
+    sb.rpc('admin_overview'),
+    sb.rpc('progress_stats').then(check),
+    sb.from('profiles').select('id,full_name,email,role,active').then(check),
+    fetchAll(() => sb.from('sessions').select('id,user_id,label,total,answered,correct,points,started_at,finished_at').eq('mode', 'mock').not('finished_at', 'is', null).order('started_at', { ascending: false })),
+    sb.rpc('admin_most_missed', { p_limit: 20, p_min: 3 }),
+  ]);
+  const learners = people.filter((p) => p.active && p.role !== 'admin');
+  const name = new Map(people.map((p) => [p.id, p.full_name || p.email]));
+  const final = EXAMS.find((e) => e.key === 'final'); const mock = EXAMS.find((e) => e.key === 'mock');
+  const daysTo = (e) => Math.max(0, Math.ceil((Date.parse(e.at) - Date.now()) / 864e5));
+
+  // Readiness per learner
+  const byUser = new Map(); for (const r of stats) { if (!byUser.has(r.user_id)) byUser.set(r.user_id, new Map()); byUser.get(r.user_id).set(r.category_id, r); }
+  const totalQs = sum(meta.disciplines.map((d) => d.total));
+  const rows = learners.map((p) => {
+    const st = byUser.get(p.id) || new Map(); const r = readiness(meta, st); const all = rollUp([...st.values()]);
+    const mocks = mockRows.filter((m) => m.user_id === p.id);
+    const gaps = r.per.filter((x) => x.d.weight >= 8 && x.d.total && ((x.coverage ?? 0) < 25 || (x.s.attempts >= 5 && x.acc < 60)))
+      .map((x) => `${x.d.name} (${x.d.weight}%): ${(x.coverage ?? 0) < 25 ? `${x.coverage ?? 0}% seen` : `${x.acc}% right`}`);
+    return { p, score: r.score, cover: pctNum(all.answered, totalQs) || 0, last: all.last, mock: mocks[0], gaps };
+  }).sort((a, b) => (a.score ?? -1) - (b.score ?? -1));
+
+  // Mock results: change vs that learner's previous mock
+  const prevOf = (m) => mockRows.filter((x) => x.user_id === m.user_id && Date.parse(x.started_at) < Date.parse(m.started_at))[0];
+  const groupAvg = mockRows.length ? Math.round(sum(mockRows.map(sessPct)) / mockRows.length) : null;
+
+  // Most missed: question text
+  const mm = missed.error ? [] : missed.data || [];
+  const mmQs = mm.length ? await fetchQuestions(mm.map((x) => x.question_id)) : [];
+  const qById = new Map(mmQs.map((q) => [q.id, q]));
+
+  const o = ov.error ? null : ov.data;
+  const bar = (v, max) => { const p = Math.min(100, Math.round((100 * v) / max)); return `<span class="bar ${p > 80 ? 'bad' : p > 60 ? 'warn' : 'ok'}"><span style="width:${Math.max(p, 1)}%"></span></span>`; };
+  const mb = (b) => (b / 1048576).toFixed(1) + ' MB';
+
+  view.innerHTML = `${adminTabs('insights')}
+    <h1 style="margin:0 0 4px">Insights</h1><p class="muted">Mock exam in ${daysTo(mock)} day${daysTo(mock) === 1 ? '' : 's'} · final exam in ${daysTo(final)} days.</p>
+
+    <section class="card" aria-labelledby="inR"><h2 id="inR">${icon('target')}Readiness</h2>
+      <p class="muted small">Lowest estimated score first. Flags a heavily weighted discipline (8%+ of the exam) with under 25% of its questions seen, or under 60% right.</p>
+      <div class="table-wrap"><table><thead><tr><th>Learner</th><th class="n">Est. score</th><th class="n">Latest mock</th><th class="n">Bank seen</th><th>Needs attention</th><th>Last practised</th></tr></thead><tbody>
+      ${rows.map((x) => `<tr><td><a href="#/admin/learner/${x.p.id}">${esc(name.get(x.p.id))}</a></td>
+        <td class="n">${x.score === null ? '<span class="muted">–</span>' : `<span class="acc ${accClass(x.score)}">${x.score}%</span>`}</td>
+        <td class="n">${x.mock ? `${sessPct(x.mock)}%` : '<span class="muted">none</span>'}</td>
+        <td class="n">${x.cover}%</td>
+        <td class="small">${x.gaps.length ? x.gaps.map((g) => `<span class="chip warn">${esc(g)}</span>`).join(' ') : '<span class="muted">Nothing flagged</span>'}</td>
+        <td class="small">${x.last ? esc(fmtDate(x.last)) : '<span class="muted">never</span>'}</td></tr>`).join('') || '<tr><td colspan="6" class="muted">No learners yet.</td></tr>'}
+      </tbody></table></div></section>
+
+    <section class="card" aria-labelledby="inM"><h2 id="inM">${icon('exam')}Mock exam results</h2>
+      <p class="muted small">${mockRows.length} finished mock exam${mockRows.length === 1 ? '' : 's'}${groupAvg !== null ? ` · group average ${groupAvg}%` : ''}. Mocks from 22 Nov use partial marks for multi-answer questions.</p>
+      <div class="table-wrap"><table><thead><tr><th>Learner</th><th>Date</th><th class="n">Score</th><th class="n">Marks</th><th class="n">Change</th><th class="n">Time</th></tr></thead><tbody>
+      ${mockRows.map((m) => { const pv = prevOf(m); const d = pv ? sessPct(m) - sessPct(pv) : null; const mins = Math.round((Date.parse(m.finished_at) - Date.parse(m.started_at)) / 60000);
+        return `<tr><td>${esc(name.get(m.user_id) || 'Learner')}</td><td class="small">${esc(fmtDate(m.started_at))}</td><td class="n"><span class="acc ${accClass(sessPct(m))}">${sessPct(m)}%</span></td><td class="n small">${esc(sessScore(m))}</td>
+          <td class="n">${d === null ? '<span class="muted">first</span>' : `<span class="acc ${d >= 0 ? 'hi' : 'lo'}">${d > 0 ? '+' : ''}${d}</span>`}</td><td class="n small">${mins} min</td></tr>`; }).join('') || '<tr><td colspan="6" class="muted">No mock exams finished yet.</td></tr>'}
+      </tbody></table></div></section>
+
+    <section class="card" aria-labelledby="inX"><h2 id="inX">${icon('alert')}Most missed questions</h2>
+      <p class="muted small">First attempts only, questions answered by at least 3 learners. Learners can practise this list from Practice → "Most missed by the group". A question almost everyone gets wrong is worth checking against the university file.</p>
+      ${missed.error ? `<p class="muted">${missingInDb(missed.error) ? 'Not switched on yet.' : esc(errMsg(missed.error))}</p>` : mm.length ? `<ol class="mm-list">${mm.map((x) => { const q = qById.get(x.question_id); if (!q) return '';
+        const t = meta.topicById.get(q.category_id); const d = t && meta.discById.get(t.discipline_id);
+        return `<li class="mm"><div class="row-between"><span class="small">${d ? `<span class="chip pri">${esc(d.name)}</span> ` : ''}<span class="chip">#${q.id}</span></span><span class="chip ${x.wrong_pct >= 70 ? 'bad' : 'warn'}">${x.wrong_pct}% wrong · ${x.wrong}/${x.learners} learners</span></div>
+          <p class="rq" style="margin:6px 0">${esc(q.question)}</p>
+          <ul class="ropts small">${q.options.map((op, i) => { const key = q.correct.includes(i); const pick = (x.common_wrong || []).includes(i);
+            return `<li class="${key ? 'c' : pick ? 'w' : ''}"><b>${LETTERS[i]}</b><span>${esc(op)}</span>${key ? '<span class="tag">Correct</span>' : pick ? `<span class="tag">Common wrong pick${x.common_wrong_n > 1 ? ` (${x.common_wrong_n})` : ''}</span>` : ''}</li>`; }).join('')}</ul>
+          <div class="btn-row"><a class="btn sm" href="#/admin/questions" data-open-q="${q.id}">${icon('layers')}Edit in Questions</a></div></li>`; }).join('')}</ol>` : '<p class="muted">Not enough answers yet. Each question needs first attempts from at least 3 learners.</p>'}
+    </section>
+
+    <section class="card" aria-labelledby="inU"><h2 id="inU">${icon('shield')}Supabase usage</h2>
+      ${o ? `<div class="grid stats">
+        <div class="stat"><span class="label">Database size</span><span class="value">${mb(o.db_bytes)}</span><span class="hint">${bar(o.db_bytes, 500 * 1048576)} of 500 MB free-plan limit</span></div>
+        <div class="stat"><span class="label">Connections now</span><span class="value">${o.connections}</span><span class="hint">${bar(o.connections, o.max_connections)} of ${o.max_connections}</span></div>
+        <div class="stat"><span class="label">Answers</span><span class="value">${Number(o.answers_24h).toLocaleString()}</span><span class="hint">last 24 h · ${Number(o.answers_7d).toLocaleString()} in 7 days</span></div>
+        <div class="stat"><span class="label">Learners studying</span><span class="value">${o.learners_24h}</span><span class="hint">last 24 h · ${o.learners_7d} in 7 days · ${o.open_sessions} signed in now</span></div>
+      </div>
+      <p class="muted small" style="margin:12px 0 0">Largest tables: ${(o.tables || []).map((t) => `${esc(t.name)} ${mb(t.bytes)}`).join(' · ')}. Requests are unlimited on the free plan. Data transfer (5 GB a month) is only shown in the <a href="https://supabase.com/dashboard/project/uzfzkosftfpyhhevjgee/usage" target="_blank" rel="noopener">Supabase dashboard → Usage</a>.</p>`
+      : `<p class="muted">${ov.error && missingInDb(ov.error) ? 'Not switched on yet.' : esc(errMsg(ov.error))}</p>`}
+    </section>`;
+
+  view.querySelectorAll('[data-open-q]').forEach((a) => (a.onclick = () => { state.openQuestion = +a.dataset.openQ; }));
+}
 
 /* ---------- Admin: security ---------- */
 
@@ -2413,13 +2617,57 @@ function questionEditor(editorEl, meta, q, opts = {}) {
     if (options.length < 2) { err.textContent = 'Add at least 2 options, one per line.'; f.options.focus(); return; }
     if (!correct.length) { err.textContent = 'Tick at least one correct answer.'; return; }
     const row = { category_id: +f.category_id.value, question: f.question.value.trim(), options, correct, correct_index: correct[0], qtype: correct.length > 1 ? 'CM' : 'CS', explanation: f.explanation.value.trim() || null };
+    if (!isNew) {
+      const keyText = (opts2, key) => key.map((k) => opts2[k]).join('|');
+      if (!sameSet(correct, q.correct) || keyText(options, correct) !== keyText(q.options, q.correct)) {
+        if (!confirm('This changes the answer key, or the text of a correct option.\n\nKeys must match the university file exactly. Continue only if the file says so.')) return;
+      }
+    }
     try {
       if (isNew) check(await sb.from('questions').insert(row)); else check(await sb.from('questions').update(row).eq('id', q.id));
       toast('Saved.', 'ok'); state.meta = null; opts.onSaved && opts.onSaved();
     } catch (e2) { err.textContent = errMsg(e2); }
   };
+  if (!isNew) {
+    f.insertAdjacentHTML('beforeend', `<details class="qhist"><summary>${icon('clock')}Change history</summary><div class="qhist-body">${loading}</div></details>`);
+    f.querySelector('.qhist').addEventListener('toggle', (e) => { if (e.target.open) loadQuestionHistory(f.querySelector('.qhist-body'), q, opts); }, { once: true });
+  }
   editorEl.scrollIntoView({ behavior: window.matchMedia('(prefers-reduced-motion: reduce)').matches ? 'auto' : 'smooth', block: 'start' });
   f.question.focus({ preventScroll: true });
+}
+
+/** Admin: past versions of one question, with Undo. Every edit is logged by the database. */
+async function loadQuestionHistory(box, q, opts = {}) {
+  const { data, error } = await sb.from('question_history').select('id,action,changed_at,changed_by,old_row,new_row,key_changed').eq('question_id', q.id).order('changed_at', { ascending: false }).limit(30);
+  if (error) { box.innerHTML = `<p class="muted small">${missingInDb(error) ? 'History is not switched on yet.' : esc(errMsg(error))}</p>`; return; }
+  if (!data.length) { box.innerHTML = '<p class="muted small">No changes recorded yet. Edits from now on are kept here.</p>'; return; }
+  const keyLetters = (r) => (r && Array.isArray(r.correct) ? r.correct.map((k) => LETTERS[k]).join(', ') : '–');
+  const what = (h) => {
+    if (h.action === 'delete') return 'Question deleted';
+    const o = h.old_row, n = h.new_row, parts = [];
+    if (o.question !== n.question) parts.push('question text');
+    if (JSON.stringify(o.options) !== JSON.stringify(n.options)) parts.push(`options (${(o.options || []).length} → ${(n.options || []).length})`);
+    if (JSON.stringify(o.correct) !== JSON.stringify(n.correct)) parts.push(`key ${keyLetters(o)} → ${keyLetters(n)}`);
+    if ((o.explanation || '') !== (n.explanation || '')) parts.push('explanation');
+    if (o.category_id !== n.category_id) parts.push('topic');
+    if (o.active !== n.active) parts.push(n.active ? 'shown' : 'hidden');
+    return 'Changed: ' + (parts.join(', ') || 'details');
+  };
+  box.innerHTML = `<ol class="qhist-list">${data.map((h) => `<li>
+      <div class="row-between"><span><b>${esc(fmtDate(h.changed_at))}</b> · ${esc(what(h))}</span>${h.key_changed ? `<span class="chip bad">${icon('alert')}Answer key changed</span>` : ''}</div>
+      <details><summary class="small">Version before this change</summary><p class="small"><b>${esc(h.old_row.question)}</b></p>
+        <ul class="ropts small">${(h.old_row.options || []).map((o, i) => `<li class="${(h.old_row.correct || []).includes(i) ? 'c' : ''}"><b>${LETTERS[i]}</b><span>${esc(o)}</span>${(h.old_row.correct || []).includes(i) ? '<span class="tag">Correct</span>' : ''}</li>`).join('')}</ul></details>
+      ${h.action === 'update' ? `<button class="btn sm" type="button" data-undo="${h.id}">${icon('retry')}Undo: restore this version</button>` : ''}
+    </li>`).join('')}</ol>`;
+  box.querySelectorAll('[data-undo]').forEach((b) => (b.onclick = async () => {
+    const h = data.find((x) => x.id === +b.dataset.undo); const o = h.old_row;
+    if (!confirm(`Restore the version from before ${fmtDate(h.changed_at)}?${h.key_changed ? '\n\nThis also restores the old answer key.' : ''}`)) return;
+    b.disabled = true;
+    try {
+      check(await sb.from('questions').update({ category_id: o.category_id, question: o.question, options: o.options, correct: o.correct, correct_index: o.correct_index, qtype: o.qtype, explanation: o.explanation, active: o.active }).eq('id', q.id));
+      toast('Previous version restored. The undo is in the history too.', 'ok'); state.meta = null; opts.onSaved && opts.onSaved();
+    } catch (e) { b.disabled = false; toast(errMsg(e), 'bad'); }
+  }));
 }
 
 async function renderAdminQuestions() {
@@ -2562,6 +2810,11 @@ async function renderAdminQuestions() {
   const editorEl = view.querySelector('#editor');
   const openEditor = (q) => questionEditor(editorEl, meta, q, { defaultCat: +fTopic.value, onSaved: () => renderAdminQuestions() });
   view.querySelector('#newQ').onclick = () => openEditor(null);
+  if (state.openQuestion) {   // arrived from Insights → "Edit in Questions"
+    const id = state.openQuestion; state.openQuestion = null;
+    const { data } = await sb.from('questions').select(QCOLS + ',active').eq('id', id).maybeSingle();
+    if (data) openEditor(data); else toast('That question no longer exists.', 'bad');
+  }
 }
 
 /* =========================================================================
