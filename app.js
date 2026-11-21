@@ -340,8 +340,20 @@ function readiness(meta, stats) {
   const allW = sum(meta.disciplines.filter((d) => d.total).map((d) => d.weight));
   return { per, score, weightCovered: allW ? Math.round((100 * W) / allW) : 0 };
 }
+/* Mock exams from 22 Nov 2026 carry partial marks (sessions.points); older
+   sessions have points = null and are scored as whole questions right. */
+const markFor = (q, sel) => {
+  const key = new Set(q.correct); const picked = [...sel];
+  if (q.qtype !== 'CM') return sameSet(picked, q.correct) ? 1 : 0;
+  const hits = picked.filter((i) => key.has(i)).length; const wrong = picked.length - hits;
+  return (hits - wrong) / Math.max(key.size, 1);
+};
+const fmtMark = (m) => (Math.round(m * 100) / 100).toString();
+const sessPct = (s) => (s.points != null && s.answered ? Math.round((100 * Number(s.points)) / s.answered) : pctNum(s.correct, s.answered));
+const sessScore = (s) => (s.points != null ? `${fmtMark(Number(s.points))}/${s.answered} marks` : `${s.correct}/${s.answered}`);
+
 async function sessionsFor(userId) {
-  return check(await sb.from('sessions').select('id,mode,label,total,answered,correct,started_at,finished_at')
+  return check(await sb.from('sessions').select('id,mode,label,total,answered,correct,points,started_at,finished_at')
     .eq('user_id', userId).gt('answered', 0).order('started_at').limit(500));
 }
 
@@ -697,7 +709,7 @@ async function renderHome() {
     <div class="grid stats">
       <div class="stat"><span class="label">${icon('target')}Estimated exam score</span><span class="value">${r.score === null ? '–' : r.score + '<small>%</small>'}</span>
         <span class="hint">${r.score === null ? 'Answer at least 5 questions in a discipline to start the estimate.' : `Weighted by the exam blueprint · covers ${r.weightCovered}% of the exam`}</span></div>
-      <div class="stat"><span class="label">${icon('exam')}Latest mock exam</span><span class="value">${lastMock ? pct(lastMock.correct, lastMock.total) : '–'}</span>
+      <div class="stat"><span class="label">${icon('exam')}Latest mock exam</span><span class="value">${lastMock ? sessPct(lastMock) + '%' : '–'}</span>
         <span class="hint">${lastMock ? `${lastMock.correct}/${lastMock.total} · ${fmtDate(lastMock.started_at)} · ${mocks.length} taken` : 'No mock exam yet'}</span></div>
       <div class="stat"><span class="label">${icon('check')}Accuracy</span><span class="value">${pct(overall.correct, overall.attempts)}</span>
         <span class="hint">${overall.attempts.toLocaleString()} answers in total</span></div>
@@ -1441,7 +1453,7 @@ function reviewItem(it, meta = state.meta) {
   const topic = meta?.topicById.get(q.category_id);
   const v = it.sel.size ? verdictFor(q, it.sel) : { cls: 'bad', text: 'Not answered', icon: 'x' };
   return `<li>
-    <div class="qmeta"><span class="chip ${v.cls === 'ok' ? 'ok' : v.cls === 'part' ? 'warn' : 'bad'}">${icon(v.icon)}${v.text}</span>${topic ? `<span class="chip">${esc(topic.name)}</span>` : ''}${it.flagged ? `<span class="chip warn">${icon('flag')}Marked</span>` : ''}${reportBtn(q, it.order, ' mark-btn')}</div>
+    <div class="qmeta"><span class="chip ${v.cls === 'ok' ? 'ok' : v.cls === 'part' ? 'warn' : 'bad'}">${icon(v.icon)}${v.text}</span>${typeof it.mark === 'number' ? `<span class="chip ${it.mark >= 1 ? 'ok' : it.mark > 0 ? 'warn' : 'bad'}">Mark ${it.mark > 0 ? '+' : ''}${fmtMark(it.mark)}</span>` : ''}${topic ? `<span class="chip">${esc(topic.name)}</span>` : ''}${it.flagged ? `<span class="chip warn">${icon('flag')}Marked</span>` : ''}${reportBtn(q, it.order, ' mark-btn')}</div>
     <p class="rq">${esc(q.question)}</p>
     <ul class="ropts">${it.order.map((orig, pos) => {
       const key = q.correct.includes(orig); const chosen = it.sel.has(orig);
@@ -1525,7 +1537,7 @@ async function renderExamSetup() {
   const mpool = prefs.mockPool && (prefs.mockPool !== 'incorrect' || nWrong) ? prefs.mockPool : 'new';
 
   view.innerHTML = `
-    <div class="page-head"><div><h1>Mock exam</h1><p class="muted">A paper built to the official exam weights. Answers are revealed after you submit.</p></div></div>
+    <div class="page-head"><div><h1>Mock exam</h1><p class="muted">A paper built to the official exam weights. Answers are revealed after you submit.</p><p class="muted small">Scoring: single-answer questions score 1 or 0. Multi-answer questions give partial marks: each correct option you pick earns a share, each wrong option takes a share away, and a question can score below 0.</p></div></div>
     ${draft ? `<div class="card tight row-between" style="border-color:var(--warn)"><div class="row">${icon('clock')}<b>You have an unfinished test: ${esc(draft.label || '')}</b></div><div class="btn-row"><a class="btn primary" href="#/exam/run">Resume</a><button class="btn ghost" id="discard">Discard</button></div></div>` : ''}
     <div class="grid two">
       <section class="card" aria-labelledby="es">
@@ -1723,6 +1735,7 @@ async function submitExam() {
   for (let i = 0; i < ex.items.length; i += 8) {
     await Promise.all(ex.items.slice(i, i + 8).map(async (it) => {
       it.ok = sameSet([...it.sel], it.q.correct);
+      if (ex.mode === 'mock') it.mark = markFor(it.q, it.sel);
       const { data, error } = await sb.rpc('record_answer', { p_question_id: it.q.id, p_selected: [...it.sel], p_session_id: ex.sessionId });
       it.saved = !error;
       if (!error) it.ok = data;
@@ -1745,13 +1758,15 @@ async function renderExamResult() {
   const isMock = ex.mode === 'mock';
   const [meta, sessions] = await Promise.all([loadMeta(), sessionsFor(state.profile.id)]);
   const n = ex.items.length; const right = ex.items.filter((x) => x.ok).length;
-  const score = Math.round((100 * right) / n);
+  const partial = isMock && ex.items.every((x) => typeof x.mark === 'number');
+  const marks = partial ? ex.items.reduce((a, x) => a + x.mark, 0) : right;
+  const score = Math.round((100 * marks) / n);
   const per = new Map();
   for (const it of ex.items) {
     const t = meta.topicById.get(it.q.category_id); const d = t && meta.discById.get(t.discipline_id);
     const key = d ? d.id : 0;
     if (!per.has(key)) per.set(key, { d, n: 0, ok: 0 });
-    const p = per.get(key); p.n += 1; if (it.ok) p.ok += 1;
+    const p = per.get(key); p.n += 1; p.ok += partial ? it.mark : (it.ok ? 1 : 0);
   }
   const mins = Math.round(((ex.finishedAt || Date.now()) - ex.startedAt) / 60000);
   const unsaved = ex.items.filter((x) => x.saved === false).length;
@@ -1760,17 +1775,18 @@ async function renderExamResult() {
 
   view.innerHTML = `
     <section class="card"><div class="result-head">
-      <div class="ring" style="--p:${score};--c:var(${score >= 75 ? '--ok' : score >= 50 ? '--warn' : '--bad'})"><span>${score}%</span></div>
+      <div class="ring" style="--p:${Math.max(0, score)};--c:var(${score >= 75 ? '--ok' : score >= 50 ? '--warn' : '--bad'})"><span>${score}%</span></div>
       <div style="flex:1;min-width:240px">
         <h1>${isMock ? 'Mock exam result' : 'Test result'}</h1>
-        <p class="muted">${right} of ${n} correct · ${mins} min${isMock && prevMock ? ` · previous mock ${pct(prevMock.correct, prevMock.total)}` : ''}${isMock ? '' : ` · ${esc(ex.label)}`}</p>
+        <p class="muted">${partial ? `${fmtMark(marks)} of ${n} marks · ${right} fully correct` : `${right} of ${n} correct`} · ${mins} min${isMock && prevMock ? ` · previous mock ${sessPct(prevMock)}%` : ''}${isMock ? '' : ` · ${esc(ex.label)}`}</p>
+        ${partial ? `<p class="muted small">Multi-answer questions: each correct option you pick earns a share of the mark, and each wrong option takes a share away. A question can score below 0.</p>` : ''}
         ${unsaved ? `<p class="chip bad">${icon('alert')}${unsaved} answers were not saved because of a connection problem.</p>` : ''}
         <div class="btn-row">${isMock ? `<a class="btn primary" href="#/exam">${icon('retry')}Next mock exam</a>` : `${ex.opts ? `<button class="btn primary" id="sameAgain">${icon('retry')}New test, same settings</button>` : ''}<a class="btn" href="#/practice">Create another test</a>`}<a class="btn" href="#/progress">${icon('trend')}See progress</a></div>
       </div></div></section>
     <div class="grid two">
       <section class="card" aria-labelledby="rd"><h2 id="rd">By discipline</h2>
         <div class="table-wrap"><table><thead><tr><th>Discipline</th><th class="n">Score</th><th>Result</th></tr></thead><tbody>
-        ${[...per.values()].sort((a, b) => (a.d?.sort || 99) - (b.d?.sort || 99)).map((p) => { const a = pctNum(p.ok, p.n); return `<tr><td>${esc(p.d ? p.d.name : 'Other')}</td><td class="n">${p.ok}/${p.n}</td><td><div class="cov"><span class="bar ${barClass(a)}"><span style="width:${a}%"></span></span><small class="acc ${accClass(a)}">${a}%</small></div></td></tr>`; }).join('')}
+        ${[...per.values()].sort((a, b) => (a.d?.sort || 99) - (b.d?.sort || 99)).map((p) => { const a = pctNum(p.ok, p.n); return `<tr><td>${esc(p.d ? p.d.name : 'Other')}</td><td class="n">${partial ? fmtMark(p.ok) : p.ok}/${p.n}</td><td><div class="cov"><span class="bar ${barClass(a)}"><span style="width:${a}%"></span></span><small class="acc ${accClass(a)}">${a}%</small></div></td></tr>`; }).join('')}
         </tbody></table></div></section>
       <section class="card" aria-labelledby="rc"><h2 id="rc">${isMock ? 'Your mock exam scores' : 'Your scores'}</h2><div id="curve"></div></section>
     </div>
@@ -1812,16 +1828,16 @@ function drawCurveInto(box, sessions, { mockOnly = false, highlight = null } = {
     box.innerHTML = `<div class="empty" style="padding:24px">${icon('trend')}<p class="muted">No sessions yet. Finish a practice session or a mock exam and your scores will be plotted here.</p></div>`;
     return;
   }
-  const points = done.map((s, k) => ({ k, s, score: Math.round((100 * s.correct) / s.answered), mock: s.mode === 'mock' }));
+  const points = done.map((s, k) => ({ k, s, score: sessPct(s), mock: s.mode === 'mock' }));
   const mocks = points.filter((p) => p.mock); const prac = points.filter((p) => !p.mock);
   const summary = [trendSentence(mocks, 'Mock exams'), mockOnly ? '' : trendSentence(prac, 'Topic tests')].filter(Boolean).join(' ');
   const table = `<details class="data-table"><summary>Show scores as a table</summary><div class="table-wrap"><table><thead><tr><th>Date</th><th>Session</th><th class="n">Score</th><th class="n">Correct</th></tr></thead><tbody>
-    ${points.slice().reverse().map((p) => `<tr><td>${fmtDate(p.s.started_at)}</td><td>${p.mock ? '<span class="chip pri">Mock exam</span>' : '<span class="chip">Topic test</span>'} ${esc(p.s.label || '')}</td><td class="n"><span class="acc ${accClass(p.score)}">${p.score}%</span></td><td class="n">${p.s.correct}/${p.s.answered}</td></tr>`).join('')}
+    ${points.slice().reverse().map((p) => `<tr><td>${fmtDate(p.s.started_at)}</td><td>${p.mock ? '<span class="chip pri">Mock exam</span>' : '<span class="chip">Topic test</span>'} ${esc(p.s.label || '')}</td><td class="n"><span class="acc ${accClass(p.score)}">${p.score}%</span></td><td class="n">${sessScore(p.s)}</td></tr>`).join('')}
     </tbody></table></div></details>`;
 
   if (points.length < 4 || !window.Chart) {
     // Too few points for a meaningful trend line: show them as stat tiles instead.
-    box.innerHTML = `<div class="grid stats">${points.slice(-4).map((p) => `<div class="stat"><span class="label">${p.mock ? 'Mock exam' : 'Topic test'} · ${shortDate(p.s.started_at)}</span><span class="value">${p.score}<small>%</small></span><span class="hint">${p.s.correct}/${p.s.answered} correct</span></div>`).join('')}</div>
+    box.innerHTML = `<div class="grid stats">${points.slice(-4).map((p) => `<div class="stat"><span class="label">${p.mock ? 'Mock exam' : 'Topic test'} · ${shortDate(p.s.started_at)}</span><span class="value">${p.score}<small>%</small></span><span class="hint">${sessScore(p.s)}${p.s.points != null ? '' : ' correct'}</span></div>`).join('')}</div>
       <p class="muted small">${points.length < 4 ? `Complete ${4 - points.length} more session${4 - points.length > 1 ? 's' : ''} to see your improvement curve.` : ''}</p>${table}`;
     return;
   }
@@ -1851,7 +1867,7 @@ function drawCurveInto(box, sessions, { mockOnly = false, highlight = null } = {
         legend: { position: 'top', align: 'start', labels: { color: muted, usePointStyle: true, boxWidth: 8, boxHeight: 8 } },
         tooltip: { callbacks: {
           title: (items) => fmtDate(points[items[0].dataIndex].s.started_at),
-          label: (c) => { const p = points[c.dataIndex]; return `${p.mock ? 'Mock exam' : 'Topic test'}: ${c.parsed.y}% (${p.s.correct}/${p.s.answered})`; },
+          label: (c) => { const p = points[c.dataIndex]; return `${p.mock ? 'Mock exam' : 'Topic test'}: ${c.parsed.y}% (${sessScore(p.s)})`; },
           afterLabel: (c) => points[c.dataIndex].s.label || '',
         } },
       },
@@ -1872,13 +1888,13 @@ async function progressHTML(userId) {
   const overall = rollUp([...stats.values()]);
   const totalQs = sum(meta.disciplines.map((d) => d.total));
   const mocks = sessions.filter((s) => s.mode === 'mock');
-  const best = mocks.length ? Math.max(...mocks.map((s) => pctNum(s.correct, s.answered))) : null;
+  const best = mocks.length ? Math.max(...mocks.map(sessPct)) : null;
   const html = `
     <div class="grid stats">
       <div class="stat"><span class="label">${icon('target')}Estimated exam score</span><span class="value">${r.score === null ? '–' : r.score + '<small>%</small>'}</span><span class="hint">${r.score === null ? 'Not enough answers yet' : `Covers ${r.weightCovered}% of the exam weight`}</span></div>
       <div class="stat"><span class="label">${icon('layers')}Questions used</span><span class="value">${overall.answered.toLocaleString()}<small>/${totalQs.toLocaleString()}</small></span><span class="hint">${pct(overall.answered, totalQs)} of the bank</span></div>
       <div class="stat"><span class="label">${icon('check')}Accuracy</span><span class="value">${pct(overall.correct, overall.attempts)}</span><span class="hint">${nWrong.toLocaleString()} incorrect · ${nMarked.toLocaleString()} marked</span></div>
-      <div class="stat"><span class="label">${icon('exam')}Mock exams</span><span class="value">${mocks.length}</span><span class="hint">${best === null ? 'None yet' : `Best ${best}% · latest ${pct(mocks[mocks.length - 1].correct, mocks[mocks.length - 1].answered)}`}</span></div>
+      <div class="stat"><span class="label">${icon('exam')}Mock exams</span><span class="value">${mocks.length}</span><span class="hint">${best === null ? 'None yet' : `Best ${best}% · latest ${sessPct(mocks[mocks.length - 1])}%`}</span></div>
     </div>
     <section class="card" aria-labelledby="pc"><h2 id="pc">Improvement curve</h2><p class="muted small">Every finished session, oldest to newest. Weighted mock exams are the solid line; topic tests (tutor and exam mode) are dashed.</p><div id="curve"></div></section>
     <section class="card" aria-labelledby="pd"><h2 id="pd">Readiness by discipline</h2>
