@@ -1,5 +1,5 @@
 /* Design system: UI/UX Pro Max "Minimalism & Swiss Style", medical teal palette,
-   Figtree (headings) + Noto Sans (body). Tokens are semantic; components never use raw hex. */
+   System fonts (no third-party font requests). Tokens are semantic; components never use raw hex. */
 :root {
   --bg: #f0fdfa;
   --surface: #ffffff;
@@ -25,8 +25,8 @@
   --radius-sm: 8px;
   --shadow: 0 1px 2px rgba(15, 47, 45, .06), 0 2px 8px rgba(15, 47, 45, .05);
   --space-1: 4px; --space-2: 8px; --space-3: 12px; --space-4: 16px; --space-5: 24px; --space-6: 32px; --space-7: 48px;
-  --font-head: "Figtree", system-ui, -apple-system, "Segoe UI", sans-serif;
-  --font-body: "Noto Sans", system-ui, -apple-system, "Segoe UI", sans-serif;
+  --font-head: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  --font-body: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
   --ease: cubic-bezier(.2, .8, .2, 1);
   --t: 180ms;
   --z-header: 20; --z-bottomnav: 30; --z-toast: 100;
@@ -100,7 +100,7 @@ svg.i { width: 20px; height: 20px; flex: none; stroke: currentColor; fill: none;
 main { max-width: 1120px; margin: 0 auto; padding: var(--space-5) var(--space-4) var(--space-7); }
 main:focus { outline: none; }
 .bottom-nav { display: none; }
-@media (max-width: 860px) {
+@media (max-width: 1000px) {
   .nav { display: none; }
   .me .who span { display: none; }
   .bottom-nav {
@@ -202,7 +202,7 @@ legend { font-family: var(--font-head); font-weight: 700; color: var(--text-stro
 .topic .tname { flex: 1; min-width: 0; overflow-wrap: anywhere; }
 .topic .tmeta { color: var(--muted); font-size: .8125rem; white-space: nowrap; font-variant-numeric: tabular-nums; }
 .sticky-start { position: sticky; bottom: var(--space-4); z-index: 5; }
-@media (max-width: 860px) { .sticky-start { bottom: calc(76px + env(safe-area-inset-bottom)); } }
+@media (max-width: 1000px) { .sticky-start { bottom: calc(76px + env(safe-area-inset-bottom)); } }
 .start-bar { display: flex; align-items: center; justify-content: space-between; gap: var(--space-3); flex-wrap: wrap; background: var(--surface); border: 1px solid var(--line-strong); border-radius: var(--radius); padding: var(--space-3) var(--space-4); box-shadow: 0 6px 24px rgba(15, 47, 45, .12); }
 
 /* ---------- chips, bars ---------- */
@@ -347,7 +347,7 @@ details.data-table summary { cursor: pointer; color: var(--primary); font-weight
 
 /* ---------- toasts ---------- */
 #toasts { position: fixed; left: 50%; bottom: calc(24px + env(safe-area-inset-bottom)); transform: translateX(-50%); z-index: var(--z-toast); display: flex; flex-direction: column; gap: var(--space-2); width: min(92vw, 420px); pointer-events: none; }
-@media (max-width: 860px) { #toasts { bottom: calc(84px + env(safe-area-inset-bottom)); } }
+@media (max-width: 1000px) { #toasts { bottom: calc(84px + env(safe-area-inset-bottom)); } }
 .toast { pointer-events: auto; display: flex; align-items: center; gap: var(--space-2); background: var(--text-strong); color: var(--bg); padding: 12px 16px; border-radius: 10px; box-shadow: 0 8px 28px rgba(0, 0, 0, .2); font-size: .95rem; transition: opacity 240ms var(--ease), transform 240ms var(--ease); }
 .toast.ok { background: var(--ok); color: #fff; }
 .toast.bad { background: var(--bad); color: #fff; }
@@ -418,7 +418,7 @@ ul.flags li { padding: 10px 12px; border: 1px solid var(--line); border-left: 3p
 .cd-head { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; flex-wrap: wrap; margin-bottom: var(--space-2); }
 .cd-clock { display: flex; gap: var(--space-2); font-variant-numeric: tabular-nums; }
 .cd-unit { flex: 1; text-align: center; background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius-sm); padding: 6px 4px; }
-.cd-unit b { display: block; font-family: Figtree, sans-serif; font-size: 1.5rem; line-height: 1.1; color: var(--primary); }
+.cd-unit b { display: block; font-family: var(--font-head); font-size: 1.5rem; line-height: 1.1; color: var(--primary); }
 .cd-unit small { color: var(--muted); font-size: .75rem; }
 .cd-today { display: flex; align-items: center; gap: 6px; font-weight: 700; color: var(--ok); }
 .cd-quote { display: flex; gap: 10px; align-items: flex-start; margin: 0; padding: var(--space-3); border-left: 3px solid var(--primary); background: var(--primary-soft); border-radius: var(--radius-sm); font-style: italic; color: var(--text-strong); }
@@ -462,3 +462,30 @@ label.radio:has(input:checked) { border-color: var(--primary); background: var(-
 .mm .ropts li { display: flex; gap: 8px; padding: 2px 0; }
 .mm .ropts li.c b, .mm .ropts li.c span:first-of-type { color: var(--ok); }
 .mm .ropts li.w b, .mm .ropts li.w span:first-of-type { color: var(--bad); }
+
+/* Mock exam mark out of 10 */
+.final10 { font-size: 1.15rem; margin: 2px 0 6px; }
+.final10 b { font-size: 1.6rem; color: var(--primary); }
+.ring span small { font-size: .55em; font-weight: 600; opacity: .8; }
+
+/* Learner readiness card */
+.readiness .rd-more { margin-top: 8px; }
+.readiness .rd-more summary { cursor: pointer; font-weight: 600; color: var(--primary); }
+
+/* Conversations: feedback and report threads */
+.tickets { list-style: none; padding: 0; margin: 0; display: grid; gap: 12px; }
+.ticket summary { cursor: pointer; list-style: none; display: grid; gap: 4px; }
+.ticket summary::-webkit-details-marker { display: none; }
+.ticket[open] summary { margin-bottom: 8px; }
+.thread { list-style: none; padding: 0; margin: 8px 0; display: grid; gap: 8px; }
+.msg { border: 1px solid var(--line); border-radius: 10px; padding: 8px 12px; background: var(--surface-2); max-width: 92%; }
+.msg.admin { background: var(--primary-soft); justify-self: end; }
+.msg p { margin: 4px 0 0; white-space: pre-wrap; overflow-wrap: anywhere; }
+.msg-head { display: flex; gap: 8px; justify-content: space-between; align-items: baseline; }
+.reply-form { margin-top: 8px; }
+.notif-item.notice .notice-list { margin: 8px 0; }
+
+/* Six menu items + Admin: keep labels on one line; drop the menu icons on narrower desktops */
+.nav a { white-space: nowrap; }
+@media (max-width: 1280px) { .nav a .i { display: none; } .nav a { padding: 0 var(--space-2); } .who span { max-width: 120px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; } }
+@media (max-width: 1100px) { .me .who span { display: none; } }

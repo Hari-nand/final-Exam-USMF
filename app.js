@@ -1,9 +1,20 @@
-import { createClient } from 'https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/+esm';
 import { SUPABASE_URL, SUPABASE_ANON_KEY, APP_NAME, SHUFFLE_OPTIONS } from './config.js';
 
 /* =========================================================================
    Setup & helpers
    ========================================================================= */
+
+// Refuse to run inside another site's frame (clickjacking). GitHub Pages can't send the header for this.
+if (window.top !== window.self) {
+  document.body.innerHTML = '<p style="padding:24px;font:16px system-ui">This page can only be opened directly. <a href="' + location.href.replace(/"/g, '') + '" target="_top" rel="noopener">Open USMF Exam Prep</a></p>';
+  throw new Error('Framed');
+}
+// Supabase JS is loaded by index.html as a pinned file with an integrity hash.
+const createClient = window.supabase?.createClient;
+if (!createClient) {
+  document.getElementById('app').innerHTML = '<div class="boot">A required file could not be loaded. Check your connection and reload the page.</div>';
+  throw new Error('supabase-js did not load');
+}
 
 const configured = !SUPABASE_URL.includes('YOUR-PROJECT') && !SUPABASE_ANON_KEY.startsWith('YOUR-');
 const sb = configured ? createClient(SUPABASE_URL, SUPABASE_ANON_KEY) : null;
@@ -145,6 +156,7 @@ function download(filename, text, type = 'application/json') {
 
 /* Lucide-style SVG icons (one stroke style everywhere, no emoji) */
 const ICONS = {
+  chat: '<path d="M21 12a8 8 0 0 1-11.6 7.1L4 20.5l1.4-4.9A8 8 0 1 1 21 12z"/><path d="M8.5 11h7M8.5 14.5h4"/>',
   bell: '<path d="M6 8a6 6 0 0 1 12 0c0 7 3 9 3 9H3s3-2 3-9"/><path d="M10.3 21a1.94 1.94 0 0 0 3.4 0"/>',
   home: '<path d="M3 10.5 12 3l9 7.5"/><path d="M5 9.5V21h5v-6h4v6h5V9.5"/>',
   book: '<path d="M2 4h6a4 4 0 0 1 4 4v13a3 3 0 0 0-3-3H2z"/><path d="M22 4h-6a4 4 0 0 0-4 4v13a3 3 0 0 1 3-3h7z"/>',
@@ -351,6 +363,11 @@ const markFor = (q, sel) => {
 const fmtMark = (m) => (Math.round(m * 100) / 100).toString();
 const sessPct = (s) => (s.points != null && s.answered ? Math.round((100 * Number(s.points)) / s.answered) : pctNum(s.correct, s.answered));
 const sessScore = (s) => (s.points != null ? `${fmtMark(Number(s.points))}/${s.answered} marks` : `${s.correct}/${s.answered}`);
+/* Mock exam final mark out of 10: same marks as above, divided by the number of
+   questions in the paper and scaled to 10 (never below 0). */
+const out10 = (marks, n) => Math.max(0, Math.round((1000 * marks) / Math.max(n, 1)) / 100);
+const fmt10 = (v) => v.toFixed(2);
+const sess10 = (s) => out10(s.points != null ? Number(s.points) : s.correct, s.total || s.answered);
 
 async function sessionsFor(userId) {
   return check(await sb.from('sessions').select('id,mode,label,total,answered,correct,points,started_at,finished_at')
@@ -428,6 +445,7 @@ const NAV = [
   ['practice', '#/practice', 'Practice', 'book'],
   ['exam', '#/exam', 'Mock exam', 'exam'],
   ['progress', '#/progress', 'Progress', 'trend'],
+  ['feedback', '#/feedback', 'Feedback', 'chat'],
 ];
 function shell(active, inner) {
   const p = state.profile;
@@ -463,6 +481,7 @@ const routes = {
   'exam/result': renderExamResult,
   progress: renderMyProgress,
   account: renderAccount,
+  feedback: renderFeedback,
   'admin/learners': renderAdminLearners,
   'admin/learner': renderAdminLearner,
   'admin/questions': renderAdminQuestions,
@@ -485,6 +504,8 @@ async function router() {
     route = 'admin/' + (parts[1] || 'learners'); param = parts[2];
   } else if (route === 'exam' && parts[1]) {
     route = 'exam/' + parts[1];
+  } else if (route === 'feedback') {
+    param = parts[1];
   }
   if (route === 'login') { location.hash = '#/home'; return; }
   const fn = routes[route] || renderHome;
@@ -497,7 +518,8 @@ async function router() {
     console.error(e);
     const view = document.getElementById('view') || $app;
     view.innerHTML = `<div class="card empty">${icon('alert')}<h2>Something went wrong</h2><p class="muted">${esc(errMsg(e))}</p>
-      <button class="btn primary" onclick="location.reload()">${icon('retry')}Reload</button></div>`;
+      <button class="btn primary" data-reload>${icon('retry')}Reload</button></div>`;
+    view.querySelector('[data-reload]').onclick = () => location.reload();
   }
 }
 
@@ -568,13 +590,41 @@ async function loadAnnouncements() {
   const now = Date.now();
   const reads = await sb.from('notice_reads').select('announcement_id').eq('user_id', state.profile.id);
   state.noticeReads = new Set(reads.error ? [] : reads.data.map((r) => r.announcement_id));
-  return (data || []).filter((a) => Date.parse(a.show_from) <= now && (!a.show_until || Date.parse(a.show_until) > now));
+  const live = (data || []).filter((a) => Date.parse(a.show_from) <= now && (!a.show_until || Date.parse(a.show_until) > now));
+  // Notices dismissed on this device before "Got it" was saved online: save them now.
+  if (!reads.error) {
+    const local = (store.get(updatesKey()) || []).filter((id) => live.some((a) => a.id === id) && !state.noticeReads.has(id));
+    if (local.length) {
+      local.forEach((id) => state.noticeReads.add(id));
+      sb.from('notice_reads').upsert(local.map((id) => ({ announcement_id: id, user_id: state.profile.id })), { onConflict: 'announcement_id,user_id', ignoreDuplicates: true }).then(() => {}, () => {});
+    }
+  }
+  state.noticeCache = { at: Date.now(), list: live };
+  return live;
+}
+/** Live notices this learner hasn't pressed "Got it" on. They count in the bell until then. */
+const unreadNotices = (list) => { const seen = store.get(updatesKey()) || []; return list.filter((u) => !seen.includes(u.id) && !state.noticeReads?.has(u.id)); };
+async function unreadNoticeList(force = false) {
+  const list = !force && state.noticeCache && Date.now() - state.noticeCache.at < 60000 ? state.noticeCache.list : await loadAnnouncements();
+  return unreadNotices(list);
+}
+function markNoticeRead(id) {
+  const seen = store.get(updatesKey()) || [];
+  if (!seen.includes(id)) seen.push(id);
+  store.set(updatesKey(), seen);
+  state.noticeReads?.add(id);
+  sb.from('notice_reads').upsert({ announcement_id: id, user_id: state.profile.id }, { onConflict: 'announcement_id,user_id', ignoreDuplicates: true }).then(({ error }) => { if (error && !missingInDb(error)) console.warn(error); });
+  document.querySelectorAll(`[data-update="${CSS.escape(id)}"]`).forEach((el) => el.remove());
+  bellCache.at = 0; paintBell(true);
 }
 const longDate = (ts) => new Date(ts).toLocaleDateString('en-GB', { day: 'numeric', month: 'long', year: 'numeric' });
 const updatesKey = () => 'mcq-updates-seen:' + (state.profile ? state.profile.id : '');
+function noticeBody(u) {
+  return `${u.intro ? `<p class="muted">${esc(u.intro)}</p>` : ''}
+      <ul class="notice-list">${(Array.isArray(u.items) ? u.items : []).map(([ic, t, d]) => `<li>${icon(ICONS[ic] ? ic : 'check')}<div><b>${esc(t)}</b><p>${esc(d)}</p></div></li>`).join('')}</ul>`;
+}
 function updateCards(list) {
-  const seen = store.get(updatesKey()) || [];
-  return list.filter((u) => !seen.includes(u.id) && !state.noticeReads?.has(u.id)).map((u) => `
+  return unreadNotices(list).map((u) => `
     <section class="card update" data-update="${esc(u.id)}" aria-labelledby="up-${esc(u.id)}">
       <div class="row-between"><h2 id="up-${esc(u.id)}">${icon('shield')}${esc(u.title)}</h2><span class="muted small">${esc(longDate(u.show_from))}</span></div>
       ${u.intro ? `<p class="muted">${esc(u.intro)}</p>` : ''}
@@ -583,14 +633,7 @@ function updateCards(list) {
     </section>`).join('');
 }
 function wireUpdates(root) {
-  root.querySelectorAll('[data-dismiss-update]').forEach((b) => (b.onclick = () => {
-    const seen = store.get(updatesKey()) || [];
-    if (!seen.includes(b.dataset.dismissUpdate)) seen.push(b.dataset.dismissUpdate);
-    store.set(updatesKey(), seen);
-    state.noticeReads?.add(b.dataset.dismissUpdate);
-    sb.from('notice_reads').upsert({ announcement_id: b.dataset.dismissUpdate, user_id: state.profile.id }, { onConflict: 'announcement_id,user_id', ignoreDuplicates: true }).then(({ error }) => { if (error && !missingInDb(error)) console.warn(error); });
-    b.closest('.update')?.remove();
-  }));
+  root.querySelectorAll('[data-dismiss-update]').forEach((b) => (b.onclick = () => markNoticeRead(b.dataset.dismissUpdate)));
 }
 
 /* ---------------------------------------------------------------
@@ -675,6 +718,38 @@ function openCountdownPopup() {
   tickCountdowns();
 }
 
+/* Exam readiness for the signed-in learner: the same rules as Admin → Insights.
+   A discipline needs attention when under 25% of its questions are seen, or
+   accuracy is under 60% after at least 5 answers. */
+function readinessStatus(p) {
+  if (!p.s.attempts) return ['Not started', ''];
+  if ((p.coverage ?? 0) < 25 || (p.s.attempts >= 5 && p.acc < 60)) return ['Needs attention', 'warn'];
+  return ['On track', 'ok'];
+}
+function readinessCard(r, overall, totalQs, lastMock) {
+  const final = EXAMS.find((e) => e.key === 'final');
+  const days = final ? Math.max(0, Math.ceil((Date.parse(final.at) - Date.now()) / 864e5)) : null;
+  const list = r.per.filter((p) => p.d.total && p.d.weight > 0).sort((a, b) => b.d.weight - a.d.weight);
+  const focus = list.filter((p) => readinessStatus(p)[0] !== 'On track').slice(0, 3);
+  const seen = pctNum(overall.answered, totalQs) || 0;
+  const level = r.score === null ? null : r.score >= 75 ? ['Well prepared', 'ok'] : r.score >= 60 ? ['Getting there', 'pri'] : ['Needs more work', 'warn'];
+  const why = (p) => (!p.s.attempts ? 'not started yet' : (p.coverage ?? 0) < 25 ? `only ${p.coverage ?? 0}% of its questions seen` : `${p.acc}% right`);
+  return `<section class="card readiness" aria-labelledby="rdH">
+    <div class="row-between"><h2 id="rdH">${icon('target')}Your exam readiness</h2>${level ? `<span class="chip ${level[1]}">${level[0]}</span>` : ''}</div>
+    <p class="muted">${r.score === null ? 'Answer at least 5 questions in a discipline to get an estimate.' : `Estimated score <b>${r.score}%</b> (about <b>${fmt10(r.score / 10)}/10</b>), based on ${r.weightCovered}% of the exam weight.`}
+      You have seen ${seen}% of the bank${lastMock ? `, and your latest mock was ${fmt10(sess10(lastMock))}/10` : ''}.${days !== null ? ` Final exam in ${days} day${days === 1 ? '' : 's'}.` : ''}</p>
+    ${focus.length ? `<p><b>Focus next:</b> ${focus.map((p) => `${esc(p.d.name)} (${p.d.weight}% of the exam) – ${why(p)}`).join('; ')}.</p>` : r.score !== null ? '<p><b>Every discipline is on track.</b> Keep mixing mock exams with your weakest topics.</p>' : ''}
+    <details class="rd-more"${focus.length ? '' : ''}><summary>All disciplines</summary>
+      <div class="table-wrap"><table><thead><tr><th>Discipline</th><th class="n">Weight</th><th>Seen</th><th class="n">Right</th><th>Status</th><th></th></tr></thead><tbody>
+      ${list.map((p) => { const [st, cls] = readinessStatus(p); return `<tr><td>${esc(p.d.name)}</td><td class="n">${p.d.weight}%</td>
+        <td><div class="cov"><span class="bar"><span style="width:${p.coverage || 0}%"></span></span><small>${p.coverage || 0}%</small></div></td>
+        <td class="n">${p.acc === null ? '<span class="muted">–</span>' : `<span class="acc ${accClass(p.acc)}">${p.acc}%</span>`}</td>
+        <td><span class="chip ${cls}">${st}</span></td>
+        <td class="n">${st === 'On track' ? '' : `<button class="btn sm" data-drill-disc="${p.d.id}">Practise</button>`}</td></tr>`; }).join('')}
+      </tbody></table></div></details>
+  </section>`;
+}
+
 async function renderHome() {
   const view = shell('home', loading);
   const [meta, stats, sessions, pool, notices, nReports] = await Promise.all([loadMeta(), topicStats(state.profile.id), sessionsFor(state.profile.id), loadPool(), loadAnnouncements(), state.profile.role === 'admin' ? openReportCount(true) : 0, loadDrafts(true)]);
@@ -715,11 +790,13 @@ async function renderHome() {
     <div class="grid stats">
       <div class="stat"><span class="label">${icon('target')}Estimated exam score</span><span class="value">${r.score === null ? '–' : r.score + '<small>%</small>'}</span>
         <span class="hint">${r.score === null ? 'Answer at least 5 questions in a discipline to start the estimate.' : `Weighted by the exam blueprint · covers ${r.weightCovered}% of the exam`}</span></div>
-      <div class="stat"><span class="label">${icon('exam')}Latest mock exam</span><span class="value">${lastMock ? sessPct(lastMock) + '%' : '–'}</span>
-        <span class="hint">${lastMock ? `${lastMock.correct}/${lastMock.total} · ${fmtDate(lastMock.started_at)} · ${mocks.length} taken` : 'No mock exam yet'}</span></div>
+      <div class="stat"><span class="label">${icon('exam')}Latest mock exam</span><span class="value">${lastMock ? fmt10(sess10(lastMock)) + '<small>/10</small>' : '–'}</span>
+        <span class="hint">${lastMock ? `${sessPct(lastMock)}% · ${fmtDate(lastMock.started_at)} · ${mocks.length} taken` : 'No mock exam yet'}</span></div>
       <div class="stat"><span class="label">${icon('check')}Accuracy</span><span class="value">${pct(overall.correct, overall.attempts)}</span>
         <span class="hint">${overall.attempts.toLocaleString()} answers in total</span></div>
     </div>
+
+    ${readinessCard(r, overall, totalQs, lastMock)}
 
     <div class="grid two">
       <section class="card" aria-labelledby="hq1">
@@ -753,6 +830,11 @@ async function renderHome() {
   wireUpdates(view);
   wirePracticeResume(view, renderHome);
   tickCountdowns();
+  view.querySelectorAll('[data-drill-disc]').forEach((b) => (b.onclick = async () => {
+    const d = meta.discById.get(+b.dataset.drillDisc); if (!d) return;
+    b.disabled = true;
+    try { await startTest({ catIds: d.topics.filter((t) => meta.totals.get(t.id)).map((t) => t.id), mode: 'tutor', pools: ['unused', 'incorrect', 'marked', 'correct'], types: ['CS', 'CM'], count: 20 }, pool); } catch (e) { toast(errMsg(e), 'bad'); b.disabled = false; }
+  }));
   view.querySelectorAll('[data-drill]').forEach((b) => (b.onclick = async () => {
     b.disabled = true;
     try { await startTest({ catIds: [+b.dataset.drill], mode: 'tutor', pools: ['unused', 'incorrect', 'marked', 'correct'], types: ['CS', 'CM'], count: 20 }, pool); } catch (e) { toast(errMsg(e), 'bad'); b.disabled = false; }
@@ -1110,9 +1192,12 @@ const reportCache = { n: 0, at: 0 };
 async function openReportCount(force = false) {
   if (state.profile?.role !== 'admin') return 0;
   if (!force && Date.now() - reportCache.at < 60000) return reportCache.n;
-  const { count, error } = await sb.from('question_reports').select('id', { count: 'exact', head: true }).in('status', ACTIVE_REPORT);
+  const [{ count, error }, fb] = await Promise.all([
+    sb.from('question_reports').select('id', { count: 'exact', head: true }).in('status', ACTIVE_REPORT),
+    sb.from('feedback').select('id', { count: 'exact', head: true }).neq('status', 'closed'),
+  ]);
   if (error) { if (!missingInDb(error)) console.warn(error); return 0; }
-  reportCache.n = count || 0; reportCache.at = Date.now();
+  reportCache.n = (count || 0) + (fb.error ? 0 : fb.count || 0); reportCache.fb = fb.error ? 0 : fb.count || 0; reportCache.at = Date.now();
   return reportCache.n;
 }
 async function paintReportBadge() {
@@ -1128,6 +1213,98 @@ const reportsHomeCard = (n) => `<section class="card update" aria-labelledby="rp
   <a class="btn primary sm" href="#/admin/reports">Open reports ${icon('right')}</a></div>
   <p class="muted" style="margin:0">Learners flagged possible mistakes. Check each question against the university file, then fix it or mark it as no change needed.</p></section>`;
 
+/* ---------- Conversations: question reports and feedback share one thread format ---------- */
+
+const FEEDBACK_STATUS = { open: ['New', 'warn'], in_review: ['Under review', 'pri'], closed: ['Closed', 'ok'] };
+const FEEDBACK_KIND = { feedback: 'Feedback', suggestion: 'Suggestion' };
+/** ticket_messages for these reports / feedback ids, grouped as 'r<id>' / 'f<id>' → [messages oldest first]. */
+async function loadThreads(reportIds, feedbackIds) {
+  const out = new Map();
+  const get = async (col, ids) => (ids.length ? inChunks(ids, 100, (c) => fetchAll(() => sb.from('ticket_messages').select('id,report_id,feedback_id,author,from_admin,body,created_at').in(col, c).order('created_at'))) : []);
+  const [a, b] = await Promise.all([get('report_id', reportIds), get('feedback_id', feedbackIds)]).catch(() => [[], []]);
+  for (const m of [...a, ...b]) { const k = m.report_id ? 'r' + m.report_id : 'f' + m.feedback_id; if (!out.has(k)) out.set(k, []); out.get(k).push(m); }
+  return out;
+}
+/** A conversation: the learner's first message, then the replies. `nameOf(msg)` labels each one. */
+function threadHtml(first, msgs, nameOf) {
+  const one = (who, mine, body, at) => `<li class="msg ${mine ? 'admin' : 'learner'}"><div class="msg-head"><b>${esc(who)}</b><span class="muted small">${esc(fmtDate(at))}</span></div><p>${esc(body)}</p></li>`;
+  return `<ol class="thread">${first ? one(first.who, false, first.body, first.at) : ''}${msgs.map((m) => one(nameOf(m), m.from_admin, m.body, m.created_at)).join('')}</ol>`;
+}
+async function sendMessage(ticket, body) {
+  const row = ticket.type === 'r' ? { report_id: ticket.id, body } : { feedback_id: ticket.id, body };
+  check(await sb.from('ticket_messages').insert(row));
+}
+
+/* ---------- Learner: feedback & suggestions, and their question reports ---------- */
+
+async function renderFeedback(param) {
+  const view = shell('feedback', loading);
+  const uid = state.profile.id;
+  const [fb, reps] = await Promise.all([
+    sb.from('feedback').select('id,kind,subject,body,status,created_at,updated_at,closed_at').eq('user_id', uid).order('created_at', { ascending: false }).limit(200),
+    sb.from('question_reports').select('id,question_id,comment,status,created_at,resolved_at').eq('user_id', uid).order('created_at', { ascending: false }).limit(200),
+  ]);
+  if (fb.error && missingInDb(fb.error)) { view.innerHTML = `<div class="card empty">${icon('chat')}<h2>Feedback isn't switched on yet</h2><p class="muted">Please check back soon.</p></div>`; return; }
+  const feedback = check(fb); const reports = reps.error ? [] : reps.data;
+  const threads = await loadThreads(reports.map((r) => r.id), feedback.map((f) => f.id));
+  const qs = reports.length ? await fetchQuestions([...new Set(reports.map((r) => r.question_id))]).catch(() => []) : [];
+  const qById = new Map(qs.map((q) => [q.id, q]));
+  const tickets = [
+    ...feedback.map((f) => ({ type: 'f', id: f.id, title: f.subject, tag: FEEDBACK_KIND[f.kind], status: FEEDBACK_STATUS[f.status], active: f.status !== 'closed', created: f.created_at, closedAt: f.closed_at, first: f.body })),
+    ...reports.map((r) => { const q = qById.get(r.question_id); return { type: 'r', id: r.id, title: q ? (q.question.length > 90 ? q.question.slice(0, 90) + '…' : q.question) : `Question #${r.question_id}`, tag: 'Question report', status: REPORT_STATUS[r.status], active: ACTIVE_REPORT.includes(r.status), created: r.created_at, closedAt: r.resolved_at, first: r.comment }; }),
+  ].map((t) => { const m = threads.get(t.type + t.id) || []; return { ...t, msgs: m, last: m.length ? m[m.length - 1].created_at : t.created }; })
+    .sort((a, b) => (a.active === b.active ? Date.parse(b.last) - Date.parse(a.last) : a.active ? -1 : 1));
+  const openKey = param || '';
+  const card = (t) => {
+    const lastAdmin = t.msgs.length && t.msgs[t.msgs.length - 1].from_admin;
+    return `<li><details class="card ticket" id="t-${t.type}${t.id}" ${openKey === t.type + t.id ? 'open' : ''}>
+      <summary><div class="row-between"><span><span class="chip">${esc(t.tag)}</span> <b>${esc(t.title)}</b></span>
+        <span>${lastAdmin && t.active ? '<span class="chip pri">Admin replied</span> ' : ''}<span class="chip ${t.status[1]}">${esc(t.status[0])}</span></span></div>
+        <span class="muted small">Started ${esc(fmtDate(t.created))} · ${t.msgs.length} repl${t.msgs.length === 1 ? 'y' : 'ies'}</span></summary>
+      ${threadHtml({ who: 'You', body: t.first, at: t.created }, t.msgs, (m) => (m.from_admin ? 'Admin' : 'You'))}
+      ${t.active ? `<form class="reply-form" data-ticket="${t.type}${t.id}" novalidate>
+          <label class="field"><span class="sr">Your reply</span><textarea name="body" rows="2" maxlength="2000" placeholder="Write a reply to the admin"></textarea></label>
+          <div class="btn-row"><button class="btn primary sm" type="submit">${icon('right')}Send reply</button></div><p class="form-error" role="alert"></p></form>`
+        : `<p class="muted small">Closed by the admin${t.closedAt ? ` on ${esc(longDate(t.closedAt))}` : ''}. Start a new conversation below if you need more help.</p>`}
+    </details></li>`;
+  };
+  view.innerHTML = `<div class="page-head"><div><h1>Feedback</h1><p class="muted">Tell the admin what works, what doesn't, or what you'd like added. You can keep talking in each conversation until the admin closes it. Your question reports are here too.</p></div></div>
+    <form class="card" id="fbForm" novalidate>
+      <h2>${icon('chat')}New feedback or suggestion</h2>
+      <fieldset class="field"><legend>Type</legend><div class="btn-row">
+        <label class="radio"><input type="radio" name="kind" value="feedback" checked> Feedback</label>
+        <label class="radio"><input type="radio" name="kind" value="suggestion"> Suggestion</label></div></fieldset>
+      <label class="field">Subject<input type="text" name="subject" maxlength="120" required placeholder="For example: Timer in practice mode"></label>
+      <label class="field">Message<textarea name="body" rows="4" maxlength="2000" required placeholder="What happened, or what would help you?"></textarea></label>
+      <div class="btn-row"><button class="btn primary" type="submit">${icon('right')}Send to the admin</button></div>
+      <p class="form-error" role="alert"></p>
+    </form>
+    <section aria-labelledby="fbList"><h2 id="fbList">Your conversations</h2>
+      ${tickets.length ? `<ol class="tickets">${tickets.map(card).join('')}</ol>` : '<p class="muted">Nothing yet. Feedback you send, and questions you report, show up here.</p>'}</section>`;
+
+  const target = openKey && view.querySelector('#t-' + CSS.escape(openKey)); if (target) target.scrollIntoView({ block: 'start' });
+  const f = view.querySelector('#fbForm');
+  f.onsubmit = async (e) => {
+    e.preventDefault();
+    const subject = f.subject.value.trim(); const body = f.body.value.trim(); const err = f.querySelector('.form-error');
+    if (subject.length < 3) { err.textContent = 'Add a short subject (at least 3 characters).'; f.subject.focus(); return; }
+    if (body.length < 3) { err.textContent = 'Write your message (at least 3 characters).'; f.body.focus(); return; }
+    const btn = f.querySelector('[type=submit]'); btn.disabled = true;
+    try {
+      const row = check(await sb.from('feedback').insert({ kind: f.kind.value, subject, body }).select('id').single());
+      toast('Sent. The admin will reply here.', 'ok');
+      const to = '#/feedback/f' + row.id; if (location.hash === to) renderFeedback('f' + row.id); else location.hash = to;
+    } catch (x) { btn.disabled = false; err.textContent = errMsg(x); }
+  };
+  view.querySelectorAll('.reply-form').forEach((rf) => (rf.onsubmit = async (e) => {
+    e.preventDefault();
+    const body = rf.body.value.trim(); if (!body) { rf.querySelector('.form-error').textContent = 'Write a reply first.'; return; }
+    const key = rf.dataset.ticket; const btn = rf.querySelector('[type=submit]'); btn.disabled = true;
+    try { await sendMessage({ type: key[0], id: +key.slice(1) }, body); toast('Reply sent.', 'ok'); renderFeedback(key); }
+    catch (x) { btn.disabled = false; rf.querySelector('.form-error').textContent = errMsg(x); }
+  }));
+}
+
 /* ---------- Admin: reports ---------- */
 
 const REPORT_STATUS = { open: ['New', 'warn'], in_review: ['Under review', 'pri'], fixed: ['Closed: fixed', 'ok'], no_change: ['Closed: no change needed', ''] };
@@ -1135,13 +1312,20 @@ const REPORT_STATUS = { open: ['New', 'warn'], in_review: ['Under review', 'pri'
 async function renderAdminReports() {
   const view = shell('admin', loading);
   const meta = await loadMeta(true);
-  const ui = state.rui || (state.rui = { status: 'open' });
-  let q = sb.from('question_reports').select('id,question_id,user_id,comment,shown_order,status,admin_note,admin_reply,replied_at,created_at,resolved_at').order('created_at', { ascending: false }).limit(500);
+  const ui = state.rui || (state.rui = { status: 'open', kind: 'reports' });
+  if (ui.kind === 'feedback') return renderAdminFeedback(view, ui);
+  let q = sb.from('question_reports').select('id,question_id,user_id,comment,shown_order,status,awaiting_admin,admin_reply,replied_at,created_at,resolved_at').order('created_at', { ascending: false }).limit(500);
   if (ui.status === 'open') q = q.in('status', ACTIVE_REPORT); else if (ui.status === 'done') q = q.in('status', ['fixed', 'no_change']);
   const { data: reps, error } = await q;
   if (error) {
     if (missingInDb(error)) { view.innerHTML = adminTabs('reports') + `<section class="card"><h2>${icon('alert')} Reports aren't switched on yet</h2><p class="muted">Run <code>supabase/migration_006_notices_reports.sql</code> in the Supabase SQL Editor, then reload.</p></section>`; return; }
     throw error;
+  }
+  // Admin-only notes live in their own table, which learners can't read.
+  if (reps.length) {
+    const { data: notes } = await sb.from('report_notes').select('report_id,note').in('report_id', reps.map((r) => r.id));
+    const byId = new Map((notes || []).map((n) => [n.report_id, n.note]));
+    reps.forEach((r) => { r.admin_note = byId.get(r.id) || null; });
   }
   const qids = [...new Set(reps.map((r) => r.question_id))];
   const uids = [...new Set(reps.map((r) => r.user_id))];
@@ -1158,6 +1342,8 @@ async function renderAdminReports() {
   }
   const groups = qids.map((id) => ({ q: qById.get(id), id, reps: reps.filter((r) => r.question_id === id) }));
   const nOpen = await openReportCount(true);
+  const threads = await loadThreads(reps.map((r) => r.id), []);
+  const adminName = (m) => (m.from_admin ? (m.author === state.profile.id ? 'You' : 'Admin') : who.get(m.author) || 'Learner');
 
   const seenAs = (order, q) => (order && order.length && q ? order.map((orig, pos) => `${LETTERS[pos]}=${LETTERS[orig] || '?'}`).join(' · ') : '');
   const repLine = (r, q) => `<li class="rep">
@@ -1165,9 +1351,10 @@ async function renderAdminReports() {
       <p class="rep-comment">${esc(r.comment)}</p>
       ${seenAs(r.shown_order, q) ? `<p class="muted small" style="margin:0">Their letters → letters below: ${esc(seenAs(r.shown_order, q))}</p>` : ''}
       ${r.admin_note ? `<p class="small muted" style="margin:6px 0 0">Your note (admin only): ${esc(r.admin_note)}</p>` : ''}
-      ${r.admin_reply ? `<div class="rep-reply"><span class="small muted">Your reply · ${esc(fmtDate(r.replied_at))}</span><p>${esc(r.admin_reply)}</p></div>` : ''}
+      ${(threads.get('r' + r.id) || []).length ? threadHtml(null, threads.get('r' + r.id), adminName) : r.admin_reply ? `<div class="rep-reply"><span class="small muted">Your reply · ${esc(fmtDate(r.replied_at))}</span><p>${esc(r.admin_reply)}</p></div>` : ''}
+      ${r.awaiting_admin && ACTIVE_REPORT.includes(r.status) && (threads.get('r' + r.id) || []).length ? '<p><span class="chip warn">Learner replied · waiting for you</span></p>' : ''}
       ${seen.get(r.id) ? `<p class="small muted" style="margin:4px 0 0">${icon('eye')} ${seen.get(r.id).seen_at ? `Seen by ${esc(who.get(r.user_id) || 'the learner')} · ${esc(fmtDate(seen.get(r.id).seen_at))}` : 'Notification not seen yet'}</p>` : ''}
-      <div class="btn-row" style="margin-top:8px"><button class="btn sm" type="button" data-reply="${r.id}">${icon('right')}${r.admin_reply ? 'Edit reply or status' : 'Reply / change status'}</button></div>
+      <div class="btn-row" style="margin-top:8px"><button class="btn sm" type="button" data-reply="${r.id}">${icon('chat')}${ACTIVE_REPORT.includes(r.status) ? 'Message / change status' : 'Reopen or message'}</button></div>
       <div class="rep-form" data-form="${r.id}" hidden></div>
     </li>`;
   const groupCard = (g) => {
@@ -1189,13 +1376,15 @@ async function renderAdminReports() {
   };
 
   view.innerHTML = `${adminTabs('reports')}
+    ${ticketSwitch(ui)}
     <div class="row-between"><h1 style="margin:0">Question reports</h1>
       <div class="seg" role="group" aria-label="Show">${[['open', `Active (${nOpen})`], ['done', 'Closed'], ['all', 'All']].map(([k, l]) => `<button class="btn sm ${ui.status === k ? 'primary' : 'ghost'}" data-status="${k}" aria-pressed="${ui.status === k}">${l}</button>`).join('')}</div></div>
-    <p class="muted">Learners report questions they think are wrong. Check the question against the university file and edit it if needed. Reply to each learner and set the report to Under review or Closed: they get a notification. Past answers are not re-scored.</p>
+    <p class="muted">Learners report questions they think are wrong. Check the question against the university file and edit it if needed. Message each learner and set the report to Under review or Closed: they get a notification and can reply until you close it. Past answers are not re-scored.</p>
     ${groups.length ? `<ol class="rlist">${groups.map(groupCard).join('')}</ol>` : `<div class="card empty">${icon('check')}<h2>${ui.status === 'open' ? 'No open reports' : 'Nothing here'}</h2><p class="muted">${ui.status === 'open' ? 'When a learner reports a question, it shows up here.' : ''}</p></div>`}`;
   paintReportBadge();
 
   view.querySelectorAll('[data-status]').forEach((b) => (b.onclick = () => { ui.status = b.dataset.status; renderAdminReports(); }));
+  wireTicketSwitch(view, ui);
   view.querySelectorAll('.rgroup').forEach((card) => {
     const id = +card.dataset.q; const g = groups.find((x) => x.id === id);
     card.querySelectorAll('[data-act]').forEach((b) => (b.onclick = async () => {
@@ -1206,7 +1395,9 @@ async function renderAdminReports() {
       b.disabled = true;
       const note = card.querySelector('.rnote')?.value.trim() || null;
       try {
-        check(await sb.from('question_reports').update({ status: b.dataset.act, admin_note: note, resolved_at: new Date().toISOString(), resolved_by: state.profile.id }).eq('question_id', id).in('status', ACTIVE_REPORT));
+        const { data: closed, error: upErr } = await sb.from('question_reports').update({ status: b.dataset.act, resolved_at: new Date().toISOString(), resolved_by: state.profile.id }).eq('question_id', id).in('status', ACTIVE_REPORT).select('id');
+        check({ error: upErr });
+        if (note && closed?.length) check(await sb.from('report_notes').upsert(closed.map((x) => ({ report_id: x.id, note, updated_at: new Date().toISOString(), updated_by: state.profile.id })), { onConflict: 'report_id' }));
         toast(b.dataset.act === 'fixed' ? 'Closed as fixed. Reporters were notified.' : 'Closed as no change needed. Reporters were notified.', 'ok');
         reportCache.at = 0; renderAdminReports();
       } catch (err) { b.disabled = false; toast(errMsg(err), 'bad'); }
@@ -1219,8 +1410,8 @@ async function renderAdminReports() {
     if (!box.hidden) { box.hidden = true; return; }
     const next = r.status === 'open' ? 'in_review' : r.status;
     box.innerHTML = `<form novalidate>
-        <label class="field">Reply to ${esc(who.get(r.user_id) || 'the learner')}<span class="help">They see this in their notifications. Optional when you only change the status.</span>
-          <textarea name="reply" rows="3" maxlength="1000" placeholder="For example: Thanks, you were right. Option C was cut off and is now fixed.">${esc(r.admin_reply || '')}</textarea></label>
+        <label class="field">Message to ${esc(who.get(r.user_id) || 'the learner')}<span class="help">They get a notification and can reply until you close the report. Optional when you only change the status.</span>
+          <textarea name="reply" rows="3" maxlength="2000" placeholder="For example: Thanks, you were right. Option C was cut off and is now fixed."></textarea></label>
         <fieldset class="field"><legend>Status</legend><div class="btn-row">
           ${[['in_review', 'Under review'], ['fixed', 'Closed: fixed'], ['no_change', 'Closed: no change needed']].map(([k, l]) => `<label class="radio"><input type="radio" name="st" value="${k}" ${next === k ? 'checked' : ''}> ${l}</label>`).join('')}
         </div></fieldset>
@@ -1232,10 +1423,11 @@ async function renderAdminReports() {
     f.onsubmit = async (e) => {
       e.preventDefault();
       const reply = f.reply.value.trim(); const status = f.st.value;
-      if (reply === (r.admin_reply || '') && status === r.status) { f.querySelector('.form-error').textContent = 'Write a reply or choose a different status.'; return; }
+      if (!reply && status === r.status) { f.querySelector('.form-error').textContent = 'Write a message or choose a different status.'; return; }
       const btn = f.querySelector('[type=submit]'); btn.disabled = true;
       try {
-        check(await sb.from('question_reports').update({ admin_reply: reply || null, status }).eq('id', r.id));
+        if (reply) await sendMessage({ type: 'r', id: r.id }, reply);
+        if (status !== r.status) check(await sb.from('question_reports').update({ status }).eq('id', r.id));
         toast(`Sent to ${who.get(r.user_id) || 'the learner'}.`, 'ok');
         reportCache.at = 0; renderAdminReports();
       } catch (err) { btn.disabled = false; f.querySelector('.form-error').textContent = errMsg(err); }
@@ -1243,14 +1435,79 @@ async function renderAdminReports() {
   }));
 }
 
+function ticketSwitch(ui) {
+  const nFb = reportCache.fb || 0;
+  return `<div class="seg" role="group" aria-label="Kind" style="margin:0 0 12px">${[['reports', 'Question reports'], ['feedback', `Feedback & suggestions${nFb ? ` (${nFb})` : ''}`]].map(([k, l]) => `<button class="btn sm ${ui.kind === k ? 'primary' : 'ghost'}" data-kind="${k}" aria-pressed="${ui.kind === k}">${l}</button>`).join('')}</div>`;
+}
+function wireTicketSwitch(view, ui) {
+  view.querySelectorAll('[data-kind]').forEach((b) => (b.onclick = () => { ui.kind = b.dataset.kind; renderAdminReports(); }));
+}
+
+async function renderAdminFeedback(view, ui) {
+  let q = sb.from('feedback').select('id,user_id,kind,subject,body,status,awaiting_admin,created_at,updated_at,closed_at').order('updated_at', { ascending: false }).limit(300);
+  if (ui.status === 'open') q = q.neq('status', 'closed'); else if (ui.status === 'done') q = q.eq('status', 'closed');
+  const { data, error } = await q;
+  if (error) { view.innerHTML = adminTabs('reports') + ticketSwitch(ui) + `<section class="card"><p class="muted">${missingInDb(error) ? 'Feedback is not switched on yet (migration 014).' : esc(errMsg(error))}</p></section>`; wireTicketSwitch(view, ui); return; }
+  const list = data || [];
+  await openReportCount(true);
+  const uids = [...new Set(list.map((f) => f.user_id))];
+  const [people, threads] = await Promise.all([
+    uids.length ? inChunks(uids, 100, (c) => fetchAll(() => sb.from('profiles').select('id,full_name,email').in('id', c))) : [],
+    loadThreads([], list.map((f) => f.id)),
+  ]);
+  const who = new Map(people.map((p) => [p.id, p.full_name || p.email]));
+  const nameOf = (m) => (m.from_admin ? (m.author === state.profile.id ? 'You' : 'Admin') : who.get(m.author) || 'Learner');
+  const nActive = list.filter((f) => f.status !== 'closed').length;
+  const card = (f) => {
+    const [label, cls] = FEEDBACK_STATUS[f.status]; const msgs = threads.get('f' + f.id) || [];
+    return `<li class="card ticket admin" data-fb="${f.id}">
+      <div class="row-between"><span><span class="chip">${esc(FEEDBACK_KIND[f.kind])}</span> <b>${esc(f.subject)}</b></span>
+        <span>${f.awaiting_admin && f.status !== 'closed' ? '<span class="chip warn">Waiting for you</span> ' : ''}<span class="chip ${cls}">${esc(label)}</span></span></div>
+      <p class="muted small" style="margin:4px 0 8px">From <b>${esc(who.get(f.user_id) || 'Learner')}</b> · ${esc(fmtDate(f.created_at))}</p>
+      ${threadHtml({ who: who.get(f.user_id) || 'Learner', body: f.body, at: f.created_at }, msgs, nameOf)}
+      <form class="rep-form" novalidate>
+        <label class="field">Message to ${esc(who.get(f.user_id) || 'the learner')}<span class="help">They get a notification and can reply until you close this.</span>
+          <textarea name="reply" rows="2" maxlength="2000"></textarea></label>
+        <fieldset class="field"><legend>Status</legend><div class="btn-row">
+          ${[['in_review', 'Under review'], ['closed', 'Closed']].concat(f.status === 'open' ? [['open', 'Leave as New']] : []).map(([k, l]) => `<label class="radio"><input type="radio" name="st" value="${k}" ${(f.status === 'open' ? 'in_review' : f.status) === k ? 'checked' : ''}> ${l}</label>`).join('')}
+        </div></fieldset>
+        <div class="btn-row"><button class="btn primary sm" type="submit">${icon('check')}Send</button></div><p class="form-error" role="alert"></p></form>
+    </li>`;
+  };
+  view.innerHTML = `${adminTabs('reports')}${ticketSwitch(ui)}
+    <div class="row-between"><h1 style="margin:0">Feedback &amp; suggestions</h1>
+      <div class="seg" role="group" aria-label="Show">${[['open', `Active (${nActive})`], ['done', 'Closed'], ['all', 'All']].map(([k, l]) => `<button class="btn sm ${ui.status === k ? 'primary' : 'ghost'}" data-status="${k}" aria-pressed="${ui.status === k}">${l}</button>`).join('')}</div></div>
+    <p class="muted">Learners send these from the Feedback page. Reply as often as you need; the conversation stays open for both of you until you close it.</p>
+    ${list.length ? `<ol class="tickets">${list.map(card).join('')}</ol>` : `<div class="card empty">${icon('chat')}<h2>${ui.status === 'open' ? 'No open feedback' : 'Nothing here'}</h2></div>`}`;
+  paintReportBadge(); wireTicketSwitch(view, ui);
+  view.querySelectorAll('[data-status]').forEach((b) => (b.onclick = () => { ui.status = b.dataset.status; renderAdminReports(); }));
+  view.querySelectorAll('[data-fb]').forEach((li) => {
+    const f = list.find((x) => x.id === +li.dataset.fb); const form = li.querySelector('form');
+    form.onsubmit = async (e) => {
+      e.preventDefault();
+      const reply = form.reply.value.trim(); const status = form.st.value;
+      if (!reply && status === f.status) { form.querySelector('.form-error').textContent = 'Write a message or choose a different status.'; return; }
+      const btn = form.querySelector('[type=submit]'); btn.disabled = true;
+      try {
+        if (reply) await sendMessage({ type: 'f', id: f.id }, reply);
+        if (status !== f.status) check(await sb.from('feedback').update({ status }).eq('id', f.id));
+        toast(status === 'closed' ? 'Sent and closed.' : 'Sent.', 'ok'); reportCache.at = 0; renderAdminReports();
+      } catch (x) { btn.disabled = false; form.querySelector('.form-error').textContent = errMsg(x); }
+    };
+  });
+}
+
 /* ---------- Notifications (bell) ---------- */
 
 const bellCache = { n: 0, at: 0 };
 async function unseenCount(force = false) {
   if (!force && Date.now() - bellCache.at < 60000) return bellCache.n;
-  const { count, error } = await sb.from('notifications').select('id', { count: 'exact', head: true }).is('seen_at', null).eq('user_id', state.profile.id);
-  if (error) { if (!missingInDb(error)) console.warn(error); return 0; }
-  bellCache.n = count || 0; bellCache.at = Date.now();
+  const [{ count, error }, notices] = await Promise.all([
+    sb.from('notifications').select('id', { count: 'exact', head: true }).is('seen_at', null).eq('user_id', state.profile.id),
+    unreadNoticeList(force).catch(() => []),
+  ]);
+  if (error && !missingInDb(error)) console.warn(error);
+  bellCache.n = (error ? 0 : count || 0) + notices.length; bellCache.at = Date.now();
   return bellCache.n;
 }
 async function paintBell(force = false) {
@@ -1282,36 +1539,77 @@ async function openNotifications() {
   back.querySelector('[data-close]').onclick = close; back.querySelector('[data-close]').focus();
   const body = back.querySelector('.notif-body');
   try {
-    const { data, error } = await sb.from('notifications')
-      .select('id,created_at,report_id,question_reports(id,question_id,comment,status,admin_reply)')
-      .eq('user_id', state.profile.id).is('seen_at', null).order('created_at', { ascending: false }).limit(50);
-    if (error) throw error;
-    const items = (data || []).filter((n) => n.question_reports);
-    if (!items.length) {
-      body.innerHTML = `<div class="empty" style="padding:24px 8px">${icon('check')}<p class="muted" style="margin:8px 0 0">No new notifications. When the admin answers one of your question reports, it shows up here.</p></div>`;
+    const [notices, res] = await Promise.all([
+      unreadNoticeList(true),
+      sb.from('notifications')
+        .select('id,created_at,kind,report_id,feedback_id,question_reports(id,question_id,comment,status,admin_reply),feedback(id,kind,subject,status)')
+        .eq('user_id', state.profile.id).is('seen_at', null).order('created_at', { ascending: false }).limit(50),
+    ]);
+    if (res.error && !missingInDb(res.error)) throw res.error;
+    const all = (res.data || []).filter((n) => n.question_reports || n.feedback);
+    const items = all.filter((n, i) => all.findIndex((x) => (x.report_id || 'f' + x.feedback_id) === (n.report_id || 'f' + n.feedback_id)) === i);
+    // Latest message from the admin on each ticket
+    const lastMsg = new Map();
+    const rIds = items.filter((n) => n.report_id).map((n) => n.report_id); const fIds = items.filter((n) => n.feedback_id).map((n) => n.feedback_id);
+    if (rIds.length || fIds.length) {
+      const [mr, mf] = await Promise.all([
+        rIds.length ? sb.from('ticket_messages').select('report_id,body,created_at').eq('from_admin', true).in('report_id', rIds).order('created_at', { ascending: false }) : { data: [] },
+        fIds.length ? sb.from('ticket_messages').select('feedback_id,body,created_at').eq('from_admin', true).in('feedback_id', fIds).order('created_at', { ascending: false }) : { data: [] },
+      ]);
+      for (const m of mr.data || []) if (!lastMsg.has('r' + m.report_id)) lastMsg.set('r' + m.report_id, m.body);
+      for (const m of mf.data || []) if (!lastMsg.has('f' + m.feedback_id)) lastMsg.set('f' + m.feedback_id, m.body);
+    }
+    if (!items.length && !notices.length) {
+      body.innerHTML = `<div class="empty" style="padding:24px 8px">${icon('check')}<p class="muted" style="margin:8px 0 0">You're all caught up. New notices, and answers from the admin to your reports and feedback, show up here.</p></div>`;
     } else {
-      const qs = await fetchQuestions([...new Set(items.map((n) => n.question_reports.question_id))]).catch(() => []);
+      const qs = items.some((n) => n.question_reports) ? await fetchQuestions([...new Set(items.filter((n) => n.question_reports).map((n) => n.question_reports.question_id))]).catch(() => []) : [];
       const qById = new Map(qs.map((q) => [q.id, q]));
-      body.innerHTML = `<p class="muted small" style="margin:8px 0 12px">These disappear once you close this panel.</p><ul class="notif-list">${items.map((n) => {
+      const noticeHtml = notices.map((u) => `<li class="notif-item notice" data-notice="${esc(u.id)}">
+          <div class="row-between"><b>${icon('shield')}${esc(u.title)}</b><span class="chip warn">Unread</span></div>
+          ${noticeBody(u)}
+          <div class="row-between"><span class="muted small">Issued by <b>${esc(u.issuer)}</b> · ${esc(longDate(u.show_from))}</span><button class="btn primary sm" type="button" data-got="${esc(u.id)}">Got it</button></div>
+        </li>`).join('');
+      const itemHtml = items.map((n) => {
+        if (n.feedback) {
+          const f = n.feedback; const [label, cls] = FEEDBACK_STATUS[f.status] || [f.status, ''];
+          const msg = lastMsg.get('f' + f.id);
+          return `<li class="notif-item">
+            <div class="row-between"><b>Your ${f.kind === 'suggestion' ? 'suggestion' : 'feedback'}: ${esc(f.subject)}</b><span class="chip ${cls}">${esc(label)}</span></div>
+            ${msg ? `<div class="rep-reply"><span class="small muted">Latest from the admin</span><p>${esc(msg)}</p></div>` : `<p class="small" style="margin:8px 0 0">${f.status === 'closed' ? 'The admin closed this conversation.' : 'The admin updated this conversation.'}</p>`}
+            <p class="small muted" style="margin:8px 0 0">${esc(fmtDate(n.created_at))}</p>
+            <div class="btn-row" style="margin-top:8px"><a class="btn sm" href="#/feedback/f${f.id}" data-go>${icon('chat')}Open conversation</a></div>
+          </li>`;
+        }
         const r = n.question_reports; const q = qById.get(r.question_id); const [label, cls] = REPORT_STATUS[r.status] || [r.status, ''];
+        const msg = lastMsg.get('r' + r.id) || r.admin_reply;
         return `<li class="notif-item">
           <div class="row-between"><b>Your question report</b><span class="chip ${cls}">${esc(label)}</span></div>
           ${q ? `<p class="small muted" style="margin:6px 0 0">${esc(q.question.length > 160 ? q.question.slice(0, 160) + '…' : q.question)}</p>` : ''}
           <p class="small" style="margin:8px 0 0">${esc(NOTE_TEXT[r.status] || '')}</p>
-          ${r.admin_reply ? `<div class="rep-reply"><span class="small muted">Reply from the admin</span><p>${esc(r.admin_reply)}</p></div>` : ''}
+          ${msg ? `<div class="rep-reply"><span class="small muted">Latest from the admin</span><p>${esc(msg)}</p></div>` : ''}
           <p class="small muted" style="margin:8px 0 0">You wrote: "${esc(r.comment.length > 140 ? r.comment.slice(0, 140) + '…' : r.comment)}" · ${esc(fmtDate(n.created_at))}</p>
-          ${q ? `<div class="btn-row" style="margin-top:8px"><button class="btn sm" type="button" data-try="${q.id}">${icon('book')}Practice this question</button></div>` : ''}
-        </li>`; }).join('')}</ul>`;
+          <div class="btn-row" style="margin-top:8px"><a class="btn sm" href="#/feedback/r${r.id}" data-go>${icon('chat')}Open conversation</a>${q ? `<button class="btn sm" type="button" data-try="${q.id}">${icon('book')}Practice this question</button>` : ''}</div>
+        </li>`; }).join('');
+      body.innerHTML = `${notices.length ? `<h3 class="small" style="margin:8px 0">Notices</h3><p class="muted small" style="margin:0 0 8px">These stay here until you press Got it.</p><ul class="notif-list">${noticeHtml}</ul>` : ''}
+        ${items.length ? `<h3 class="small" style="margin:16px 0 8px">Replies and updates</h3><p class="muted small" style="margin:0 0 8px">These disappear once you close this panel.</p><ul class="notif-list">${itemHtml}</ul>` : ''}`;
+      body.querySelectorAll('[data-got]').forEach((b) => (b.onclick = () => {
+        markNoticeRead(b.dataset.got);
+        b.closest('.notif-item')?.remove();
+        if (!body.querySelector('.notif-item')) body.innerHTML = `<div class="empty" style="padding:24px 8px">${icon('check')}<p class="muted" style="margin:8px 0 0">You're all caught up.</p></div>`;
+      }));
+      body.querySelectorAll('[data-go]').forEach((a) => a.addEventListener('click', () => close()));
       body.querySelectorAll('[data-try]').forEach((b) => (b.onclick = async () => {
         b.disabled = true; const q = qById.get(+b.dataset.try);
         try { close(); await startTutor([q], 'Reported question', null); } catch (e) { toast(errMsg(e), 'bad'); }
       }));
-      // Viewed: mark them seen so they leave the panel next time
-      const { error: e2 } = await sb.from('notifications').update({ seen_at: new Date().toISOString() }).in('id', items.map((n) => n.id));
-      if (e2) console.warn(e2);
+      // Replies and updates: viewed now, so they leave the panel next time. Notices wait for Got it.
+      if (items.length) {
+        const { error: e2 } = await sb.from('notifications').update({ seen_at: new Date().toISOString() }).in('id', all.map((n) => n.id));
+        if (e2) console.warn(e2);
+      }
     }
   } catch (e) {
-    body.innerHTML = missingInDb(e) ? `<p class="muted" style="margin:12px 0 0">Notifications aren't switched on yet.</p>` : `<p class="form-error" style="margin:12px 0 0">${esc(errMsg(e))}</p>`;
+    body.innerHTML = `<p class="form-error" style="margin:12px 0 0">${esc(errMsg(e))}</p>`;
   }
   bellCache.at = 0; paintBell(true);
 }
@@ -1555,7 +1853,7 @@ async function renderExamSetup() {
   const mpool = prefs.mockPool && (prefs.mockPool !== 'incorrect' || nWrong) ? prefs.mockPool : 'new';
 
   view.innerHTML = `
-    <div class="page-head"><div><h1>Mock exam</h1><p class="muted">A paper built to the official exam weights. Answers are revealed after you submit.</p><p class="muted small">Scoring: single-answer questions score 1 or 0. Multi-answer questions give partial marks: each correct option you pick earns a share, each wrong option takes a share away, and a question can score below 0.</p></div></div>
+    <div class="page-head"><div><h1>Mock exam</h1><p class="muted">A paper built to the official exam weights. Answers are revealed after you submit.</p><p class="muted small">Scoring: single-answer questions score 1 or 0. Multi-answer questions give partial marks: each correct option you pick earns a share, each wrong option takes a share away, and a question can score below 0. Your final mark is out of 10: total marks ÷ number of questions × 10 (lowest 0).</p></div></div>
     ${draft ? `<div class="card tight row-between" style="border-color:var(--warn)"><div class="row">${icon('clock')}<b>You have an unfinished test: ${esc(draft.label || '')}</b></div><div class="btn-row"><a class="btn primary" href="#/exam/run">Resume</a><button class="btn ghost" id="discard">Discard</button></div></div>` : ''}
     <div class="grid two">
       <section class="card" aria-labelledby="es">
@@ -1779,6 +2077,7 @@ async function renderExamResult() {
   const partial = isMock && ex.items.every((x) => typeof x.mark === 'number');
   const marks = partial ? ex.items.reduce((a, x) => a + x.mark, 0) : right;
   const score = Math.round((100 * marks) / n);
+  const final10 = out10(marks, n);
   const per = new Map();
   for (const it of ex.items) {
     const t = meta.topicById.get(it.q.category_id); const d = t && meta.discById.get(t.discipline_id);
@@ -1793,11 +2092,12 @@ async function renderExamResult() {
 
   view.innerHTML = `
     <section class="card"><div class="result-head">
-      <div class="ring" style="--p:${Math.max(0, score)};--c:var(${score >= 75 ? '--ok' : score >= 50 ? '--warn' : '--bad'})"><span>${score}%</span></div>
+      <div class="ring" style="--p:${Math.max(0, score)};--c:var(${score >= 75 ? '--ok' : score >= 50 ? '--warn' : '--bad'})"><span>${isMock ? `${fmt10(final10)}<small>/10</small>` : `${score}%`}</span></div>
       <div style="flex:1;min-width:240px">
         <h1>${isMock ? 'Mock exam result' : 'Test result'}</h1>
-        <p class="muted">${partial ? `${fmtMark(marks)} of ${n} marks · ${right} fully correct` : `${right} of ${n} correct`} · ${mins} min${isMock && prevMock ? ` · previous mock ${sessPct(prevMock)}%` : ''}${isMock ? '' : ` · ${esc(ex.label)}`}</p>
-        ${partial ? `<p class="muted small">Multi-answer questions: each correct option you pick earns a share of the mark, and each wrong option takes a share away. A question can score below 0.</p>` : ''}
+        ${isMock ? `<p class="final10">Final mark <b>${fmt10(final10)}</b> out of 10 <span class="muted">(${score}%)</span></p>` : ''}
+        <p class="muted">${partial ? `${fmtMark(marks)} of ${n} marks · ${right} fully correct` : `${right} of ${n} correct`} · ${mins} min${isMock && prevMock ? ` · previous mock ${fmt10(sess10(prevMock))}/10` : ''}${isMock ? '' : ` · ${esc(ex.label)}`}</p>
+        ${partial ? `<p class="muted small">Multi-answer questions: each correct option you pick earns a share of the mark, and each wrong option takes a share away. A question can score below 0.${isMock ? ' The final mark is your total marks divided by the number of questions, times 10 (lowest 0).' : ''}</p>` : ''}
         ${unsaved ? `<p class="chip bad">${icon('alert')}${unsaved} answers were not saved because of a connection problem.</p>` : ''}
         <div class="btn-row">${isMock ? `<a class="btn primary" href="#/exam">${icon('retry')}Next mock exam</a>` : `${ex.opts ? `<button class="btn primary" id="sameAgain">${icon('retry')}New test, same settings</button>` : ''}<a class="btn" href="#/practice">Create another test</a>`}<a class="btn" href="#/progress">${icon('trend')}See progress</a></div>
       </div></div></section>
@@ -1850,12 +2150,12 @@ function drawCurveInto(box, sessions, { mockOnly = false, highlight = null } = {
   const mocks = points.filter((p) => p.mock); const prac = points.filter((p) => !p.mock);
   const summary = [trendSentence(mocks, 'Mock exams'), mockOnly ? '' : trendSentence(prac, 'Topic tests')].filter(Boolean).join(' ');
   const table = `<details class="data-table"><summary>Show scores as a table</summary><div class="table-wrap"><table><thead><tr><th>Date</th><th>Session</th><th class="n">Score</th><th class="n">Correct</th></tr></thead><tbody>
-    ${points.slice().reverse().map((p) => `<tr><td>${fmtDate(p.s.started_at)}</td><td>${p.mock ? '<span class="chip pri">Mock exam</span>' : '<span class="chip">Topic test</span>'} ${esc(p.s.label || '')}</td><td class="n"><span class="acc ${accClass(p.score)}">${p.score}%</span></td><td class="n">${sessScore(p.s)}</td></tr>`).join('')}
+    ${points.slice().reverse().map((p) => `<tr><td>${fmtDate(p.s.started_at)}</td><td>${p.mock ? '<span class="chip pri">Mock exam</span>' : '<span class="chip">Topic test</span>'} ${esc(p.s.label || '')}</td><td class="n"><span class="acc ${accClass(p.score)}">${p.score}%</span></td><td class="n">${sessScore(p.s)}${p.mock ? ` · <b>${fmt10(sess10(p.s))}/10</b>` : ''}</td></tr>`).join('')}
     </tbody></table></div></details>`;
 
   if (points.length < 4 || !window.Chart) {
     // Too few points for a meaningful trend line: show them as stat tiles instead.
-    box.innerHTML = `<div class="grid stats">${points.slice(-4).map((p) => `<div class="stat"><span class="label">${p.mock ? 'Mock exam' : 'Topic test'} · ${shortDate(p.s.started_at)}</span><span class="value">${p.score}<small>%</small></span><span class="hint">${sessScore(p.s)}${p.s.points != null ? '' : ' correct'}</span></div>`).join('')}</div>
+    box.innerHTML = `<div class="grid stats">${points.slice(-4).map((p) => `<div class="stat"><span class="label">${p.mock ? 'Mock exam' : 'Topic test'} · ${shortDate(p.s.started_at)}</span><span class="value">${p.mock ? `${fmt10(sess10(p.s))}<small>/10</small>` : `${p.score}<small>%</small>`}</span><span class="hint">${p.mock ? `${p.score}% · ` : ''}${sessScore(p.s)}${p.s.points != null ? '' : ' correct'}</span></div>`).join('')}</div>
       <p class="muted small">${points.length < 4 ? `Complete ${4 - points.length} more session${4 - points.length > 1 ? 's' : ''} to see your improvement curve.` : ''}</p>${table}`;
     return;
   }
@@ -1885,7 +2185,7 @@ function drawCurveInto(box, sessions, { mockOnly = false, highlight = null } = {
         legend: { position: 'top', align: 'start', labels: { color: muted, usePointStyle: true, boxWidth: 8, boxHeight: 8 } },
         tooltip: { callbacks: {
           title: (items) => fmtDate(points[items[0].dataIndex].s.started_at),
-          label: (c) => { const p = points[c.dataIndex]; return `${p.mock ? 'Mock exam' : 'Topic test'}: ${c.parsed.y}% (${sessScore(p.s)})`; },
+          label: (c) => { const p = points[c.dataIndex]; return `${p.mock ? 'Mock exam' : 'Topic test'}: ${c.parsed.y}%${p.mock ? ` · ${fmt10(sess10(p.s))}/10` : ''} (${sessScore(p.s)})`; },
           afterLabel: (c) => points[c.dataIndex].s.label || '',
         } },
       },
@@ -1907,12 +2207,13 @@ async function progressHTML(userId) {
   const totalQs = sum(meta.disciplines.map((d) => d.total));
   const mocks = sessions.filter((s) => s.mode === 'mock');
   const best = mocks.length ? Math.max(...mocks.map(sessPct)) : null;
+  const best10 = mocks.length ? Math.max(...mocks.map(sess10)) : null;
   const html = `
     <div class="grid stats">
       <div class="stat"><span class="label">${icon('target')}Estimated exam score</span><span class="value">${r.score === null ? '–' : r.score + '<small>%</small>'}</span><span class="hint">${r.score === null ? 'Not enough answers yet' : `Covers ${r.weightCovered}% of the exam weight`}</span></div>
       <div class="stat"><span class="label">${icon('layers')}Questions used</span><span class="value">${overall.answered.toLocaleString()}<small>/${totalQs.toLocaleString()}</small></span><span class="hint">${pct(overall.answered, totalQs)} of the bank</span></div>
       <div class="stat"><span class="label">${icon('check')}Accuracy</span><span class="value">${pct(overall.correct, overall.attempts)}</span><span class="hint">${nWrong.toLocaleString()} incorrect · ${nMarked.toLocaleString()} marked</span></div>
-      <div class="stat"><span class="label">${icon('exam')}Mock exams</span><span class="value">${mocks.length}</span><span class="hint">${best === null ? 'None yet' : `Best ${best}% · latest ${sessPct(mocks[mocks.length - 1])}%`}</span></div>
+      <div class="stat"><span class="label">${icon('exam')}Mock exams</span><span class="value">${mocks.length}</span><span class="hint">${best === null ? 'None yet' : `Best ${fmt10(best10)}/10 · latest ${fmt10(sess10(mocks[mocks.length - 1]))}/10`}</span></div>
     </div>
     <section class="card" aria-labelledby="pc"><h2 id="pc">Improvement curve</h2><p class="muted small">Every finished session, oldest to newest. Weighted mock exams are the solid line; topic tests (tutor and exam mode) are dashed.</p><div id="curve"></div></section>
     <section class="card" aria-labelledby="pd"><h2 id="pd">Readiness by discipline</h2>
@@ -2187,7 +2488,7 @@ async function renderAdminInsights() {
 
   // Mock results: change vs that learner's previous mock
   const prevOf = (m) => mockRows.filter((x) => x.user_id === m.user_id && Date.parse(x.started_at) < Date.parse(m.started_at))[0];
-  const groupAvg = mockRows.length ? Math.round(sum(mockRows.map(sessPct)) / mockRows.length) : null;
+  const groupAvg = mockRows.length ? out10(sum(mockRows.map(sess10)), mockRows.length * 10) : null;
 
   // Most missed: question text
   const mm = missed.error ? [] : missed.data || [];
@@ -2206,18 +2507,18 @@ async function renderAdminInsights() {
       <div class="table-wrap"><table><thead><tr><th>Learner</th><th class="n">Est. score</th><th class="n">Latest mock</th><th class="n">Bank seen</th><th>Needs attention</th><th>Last practised</th></tr></thead><tbody>
       ${rows.map((x) => `<tr><td><a href="#/admin/learner/${x.p.id}">${esc(name.get(x.p.id))}</a></td>
         <td class="n">${x.score === null ? '<span class="muted">–</span>' : `<span class="acc ${accClass(x.score)}">${x.score}%</span>`}</td>
-        <td class="n">${x.mock ? `${sessPct(x.mock)}%` : '<span class="muted">none</span>'}</td>
+        <td class="n">${x.mock ? `${fmt10(sess10(x.mock))}/10` : '<span class="muted">none</span>'}</td>
         <td class="n">${x.cover}%</td>
         <td class="small">${x.gaps.length ? x.gaps.map((g) => `<span class="chip warn">${esc(g)}</span>`).join(' ') : '<span class="muted">Nothing flagged</span>'}</td>
         <td class="small">${x.last ? esc(fmtDate(x.last)) : '<span class="muted">never</span>'}</td></tr>`).join('') || '<tr><td colspan="6" class="muted">No learners yet.</td></tr>'}
       </tbody></table></div></section>
 
     <section class="card" aria-labelledby="inM"><h2 id="inM">${icon('exam')}Mock exam results</h2>
-      <p class="muted small">${mockRows.length} finished mock exam${mockRows.length === 1 ? '' : 's'}${groupAvg !== null ? ` · group average ${groupAvg}%` : ''}. Mocks from 22 Nov use partial marks for multi-answer questions.</p>
-      <div class="table-wrap"><table><thead><tr><th>Learner</th><th>Date</th><th class="n">Score</th><th class="n">Marks</th><th class="n">Change</th><th class="n">Time</th></tr></thead><tbody>
-      ${mockRows.map((m) => { const pv = prevOf(m); const d = pv ? sessPct(m) - sessPct(pv) : null; const mins = Math.round((Date.parse(m.finished_at) - Date.parse(m.started_at)) / 60000);
-        return `<tr><td>${esc(name.get(m.user_id) || 'Learner')}</td><td class="small">${esc(fmtDate(m.started_at))}</td><td class="n"><span class="acc ${accClass(sessPct(m))}">${sessPct(m)}%</span></td><td class="n small">${esc(sessScore(m))}</td>
-          <td class="n">${d === null ? '<span class="muted">first</span>' : `<span class="acc ${d >= 0 ? 'hi' : 'lo'}">${d > 0 ? '+' : ''}${d}</span>`}</td><td class="n small">${mins} min</td></tr>`; }).join('') || '<tr><td colspan="6" class="muted">No mock exams finished yet.</td></tr>'}
+      <p class="muted small">${mockRows.length} finished mock exam${mockRows.length === 1 ? '' : 's'}${groupAvg !== null ? ` · group average ${fmt10(groupAvg)}/10` : ''}. Mocks from 22 Nov use partial marks for multi-answer questions.</p>
+      <div class="table-wrap"><table><thead><tr><th>Learner</th><th>Date</th><th class="n">Final mark</th><th class="n">Score</th><th class="n">Marks</th><th class="n">Change</th><th class="n">Time</th></tr></thead><tbody>
+      ${mockRows.map((m) => { const pv = prevOf(m); const d = pv ? Math.round(100 * (sess10(m) - sess10(pv))) / 100 : null; const mins = Math.round((Date.parse(m.finished_at) - Date.parse(m.started_at)) / 60000);
+        return `<tr><td>${esc(name.get(m.user_id) || 'Learner')}</td><td class="small">${esc(fmtDate(m.started_at))}</td><td class="n"><b>${fmt10(sess10(m))}</b>/10</td><td class="n"><span class="acc ${accClass(sessPct(m))}">${sessPct(m)}%</span></td><td class="n small">${esc(sessScore(m))}</td>
+          <td class="n">${d === null ? '<span class="muted">first</span>' : `<span class="acc ${d >= 0 ? 'hi' : 'lo'}">${d > 0 ? '+' : ''}${d.toFixed(2)}</span>`}</td><td class="n small">${mins} min</td></tr>`; }).join('') || '<tr><td colspan="7" class="muted">No mock exams finished yet.</td></tr>'}
       </tbody></table></div></section>
 
     <section class="card" aria-labelledby="inX"><h2 id="inX">${icon('alert')}Most missed questions</h2>
@@ -2294,10 +2595,11 @@ async function renderAdminSecurity() {
   const settingsRes = await sb.from('security_settings').select('*').maybeSingle();
   if (settingsRes.error && missingInDb(settingsRes.error)) { view.innerHTML = adminTabs('security') + notEnabledCard(); return; }
   const c = check(settingsRes);
-  const [profiles, events, active] = await Promise.all([
+  const [profiles, events, active, audit] = await Promise.all([
     sb.from('profiles').select('id,full_name,email,role').then(check),
     loadLoginEvents(30),
     sb.from('user_sessions').select('session_id,user_id,device,ip,country,started_at,last_seen').is('ended_at', null).order('last_seen', { ascending: false }).then(check),
+    sb.from('admin_audit').select('id,at,actor,action,target,detail').order('at', { ascending: false }).limit(100).then(({ data, error }) => (error ? null : data)),
   ]);
   const names = new Map(profiles.map((p) => [p.id, p.full_name || p.email]));
   const freshCut = Date.now() - Math.max(c.idle_minutes || 60, 5) * 60000;
@@ -2330,7 +2632,10 @@ async function renderAdminSecurity() {
           : '<p class="muted">Nobody right now.</p>'}
       </section>
     </div>
-    <section class="card"><h2>Sign-in activity <span class="muted small">(last 30 days)</span></h2>${eventsTable(events.slice(0, 100), names)}</section>`;
+    <section class="card"><h2>Sign-in activity <span class="muted small">(last 30 days)</span></h2>${eventsTable(events.slice(0, 100), names)}</section>
+    <section class="card"><h2>Admin activity <span class="muted small">(latest 100)</span></h2>
+      <p class="muted small">Every account, allowlist, security-rule and notice change made by an admin. Question edits are in each question's history.</p>
+      ${auditTable(audit, names)}</section>`;
 
   const f = view.querySelector('#secForm');
   f.onsubmit = async (ev) => {
@@ -2345,6 +2650,29 @@ async function renderAdminSecurity() {
     if (!confirm(`Sign ${names.get(b.dataset.out)} out of every device now?`)) return;
     try { check(await sb.rpc('admin_sign_out_user', { p_user: b.dataset.out })); toast('Signed out.', 'ok'); renderAdminSecurity(); } catch (e) { toast(errMsg(e), 'bad'); }
   }));
+}
+
+const AUDIT_LABELS = {
+  'user.create': 'Created account', 'user.password': 'Set password', 'account.role': 'Changed role',
+  'account.enable': 'Enabled account', 'account.disable': 'Disabled account', 'account.sign_out': 'Signed out of all devices',
+  'allowlist.add': 'Added to allowlist', 'allowlist.remove': 'Removed from allowlist', 'allowlist.change': 'Changed allowlist role',
+  'edge.denied': 'Blocked call to admin tools (not an admin)', 'security.settings': 'Changed sign-in rules', 'notice.publish': 'Published notice', 'notice.delete': 'Deleted notice',
+};
+function auditDetail(a) {
+  const d = a.detail || {};
+  if (a.action === 'account.role' || a.action === 'allowlist.change') return `${esc(d.from ?? '–')} → ${esc(d.to ?? '–')}`;
+  if (a.action === 'security.settings') return Object.entries(d).filter(([k]) => k !== 'updated_at').map(([k, v]) => `${esc(k.replace(/_/g, ' '))}: ${esc(String(v.from))} → ${esc(String(v.to))}`).join('; ');
+  if (d.title) return esc(d.title);
+  if (d.role) return esc(d.role);
+  return '';
+}
+function auditTable(rows, names) {
+  if (rows === null) return '<p class="muted">The admin activity log isn\'t switched on yet (migration 013).</p>';
+  if (!rows.length) return '<p class="muted">No admin activity recorded yet.</p>';
+  const who = (id) => (id ? esc(names.get(id) || 'Unknown admin') : 'System');
+  const target = (t) => (t ? esc(names.get(t) || t) : '');
+  return `<div class="table-wrap"><table><thead><tr><th>When</th><th>Admin</th><th>Action</th><th>Who / what</th><th>Details</th></tr></thead><tbody>
+    ${rows.map((a) => `<tr><td>${fmtDate(a.at)}</td><td>${who(a.actor)}</td><td>${esc(AUDIT_LABELS[a.action] || a.action)}</td><td>${target(a.target)}</td><td class="small">${auditDetail(a)}</td></tr>`).join('')}</tbody></table></div>`;
 }
 
 /* Presence: from open sign-in sessions. last_seen moves once a minute, and only
