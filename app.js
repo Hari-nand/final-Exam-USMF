@@ -213,12 +213,16 @@ function deviceLabel() {
 }
 const missingInDb = (e) => !!e && (e.code === 'PGRST202' || e.code === 'PGRST205' || e.code === '42P01' || /Could not find the (function|table)/i.test(e.message || ''));
 
+/** "MD, SA" → "Moldova and Saudi Arabia" */
+const countryName = (c) => { try { return new Intl.DisplayNames(['en'], { type: 'region' }).of(c) || c; } catch { return c; } };
+const countryList = (list) => { const n = (list || []).map(countryName); return n.length > 1 ? `${n.slice(0, -1).join(', ')} and ${n[n.length - 1]}` : n[0] || ''; };
 function secMessage(r) {
   switch (r.reason || r.state) {
     case 'replaced': return 'You were signed out because your account was signed in on another device. Each account can be used on one device at a time.';
     case 'admin': return 'Your admin signed you out of all devices.';
     case 'idle': return `You were signed out after ${r.idle_minutes || SEC.idle} minutes without activity.`;
     case 'expired': return `For security, a sign-in lasts ${r.max_session_hours || SEC.max} hours. Please sign in again.`;
+    case 'country': return `USMF Exam Prep can only be used from ${countryList(r.allowed) || 'the allowed countries'}. ${r.country && r.country !== 'unknown' ? `Your connection appears to come from ${countryName(r.country)}.` : 'We could not tell which country your connection comes from.'} If you use a VPN, turn it off and sign in again.`;
     case 'location': return `This sign-in was blocked because your account was used from another country${r.previous ? ` (${r.previous})` : ''} in the last ${r.hours} hours. If this was you, ask your admin to allow it.`;
     default: return 'Your session has ended. Please sign in again.';
   }
@@ -392,9 +396,10 @@ function noticeItems(r) {
     r.idle_minutes ? `You are signed out after ${r.idle_minutes} minutes without activity.` : '',
     r.max_session_hours ? `You need to sign in again every ${r.max_session_hours} hours.` : '',
     'Unfinished mock exams are kept.'].filter(Boolean).join(' ')]);
+  if (r.geo_countries?.length) items.push(['alert', 'Where you can use the app', `The app can only be used from ${countryList(r.geo_countries)}. Sign-ins and activity from other countries, or through a VPN that hides your country, are blocked.`]);
   if (r.country_lock_hours) items.push(['alert', 'Location check', `A sign-in from a different country within ${r.country_lock_hours} hours of your last sign-in is blocked. If you travel, ask the admin to allow it.`]);
   items.push(
-    ['eye', 'What is recorded', 'For each sign-in we record the time, your device and browser, your approximate country and your IP address. This is used only to protect accounts, is visible only to the admin, and is deleted after 180 days. Your answers and progress are also visible to the admin.'],
+    ['eye', 'What is recorded', 'For each sign-in we record the time, your device and browser, your approximate country and your IP address. This is used only to protect accounts, is visible only to the admin, and is deleted after 90 days. Your answers and progress are also visible to the admin.'],
     ['x', 'If an account is shared', 'Accounts that show signs of sharing may be signed out or deactivated.'],
     ['book', 'Question content', 'The questions are for your personal study. Do not copy, sell or redistribute them.'],
   );
@@ -2548,7 +2553,7 @@ async function renderAdminInsights() {
 
 /* ---------- Admin: security ---------- */
 
-const EVENT_LABEL = { login: 'Signed in', replaced_other: 'Other device signed out', blocked_location: 'Blocked: new country', admin_signout: 'Signed out by admin' };
+const EVENT_LABEL = { login: 'Signed in', replaced_other: 'Other device signed out', blocked_location: 'Blocked: new country', blocked_country: 'Blocked: outside allowed countries', admin_signout: 'Signed out by admin' };
 
 /** Returns null when migration 004 isn't in the database yet. */
 async function loadLoginEvents(days = 30, userId = null) {
@@ -2569,7 +2574,7 @@ function sharingFlags(events) {
   const countries = [...new Set(ev.filter((e) => e.event === 'login' && e.country).map((e) => e.country))];
   const devices = [...new Set(ev.filter((e) => e.event === 'login' && e.device).map((e) => e.device))];
   const ips = [...new Set(ev.filter((e) => e.event === 'login' && e.ip).map((e) => e.ip))];
-  const blocked = ev.filter((e) => e.event === 'blocked_location').length;
+  const blocked = ev.filter((e) => e.event === 'blocked_location' || e.event === 'blocked_country').length;
   if (switches >= 3) out.push(`${switches} device take-overs`);
   if (countries.length >= 2) out.push(`signed in from ${countries.join(', ')}`);
   if (blocked) out.push(`${blocked} blocked sign-in${blocked > 1 ? 's' : ''} from a new country`);
@@ -2582,7 +2587,7 @@ function eventsTable(events, names = null) {
   if (!events.length) return '<p class="muted">No sign-ins recorded yet.</p>';
   return `<div class="table-wrap"><table><thead><tr><th>When</th>${names ? '<th>Learner</th>' : ''}<th>Event</th><th>Device</th><th>Country</th><th>IP address</th></tr></thead><tbody>
     ${events.map((e) => `<tr><td>${fmtDate(e.at)}</td>${names ? `<td>${esc(names.get(e.user_id) || '–')}</td>` : ''}
-      <td>${e.event === 'login' ? EVENT_LABEL.login : `<span class="chip ${e.event === 'blocked_location' ? 'bad' : 'warn'}">${esc(EVENT_LABEL[e.event] || e.event)}</span>`}${e.detail ? `<br><span class="muted small">${esc(e.detail)}</span>` : ''}</td>
+      <td>${e.event === 'login' ? EVENT_LABEL.login : `<span class="chip ${e.event.startsWith('blocked') ? 'bad' : 'warn'}">${esc(EVENT_LABEL[e.event] || e.event)}</span>`}${e.detail ? `<br><span class="muted small">${esc(e.detail)}</span>` : ''}</td>
       <td>${esc(e.device || '–')}</td><td>${esc(e.country || '–')}</td><td class="num">${esc(e.ip || '–')}</td></tr>`).join('')}
     </tbody></table></div>`;
 }
@@ -2618,6 +2623,8 @@ async function renderAdminSecurity() {
         <label class="field">Maximum length of a sign-in<select name="max_session_hours">${opt([0, 4, 8, 12, 24, 72, 168], c.max_session_hours, 'hour')}</select><span class="help">After this, the learner has to sign in again even if active.</span></label>
         <label class="field">Block sign-in from a different country within<select name="country_lock_hours">${opt([0, 6, 12, 24, 48, 168], c.country_lock_hours, 'hour')}</select>
           <span class="help">${seenCountries.length ? `Country detection is working (seen: ${esc(seenCountries.join(', '))}).` : 'The country is shown here after the next sign-in. If it never appears, this rule has no effect.'}</span></label>
+        <label class="field">Only allow use from<input type="text" name="geo_countries" value="${esc((c.geo_countries || []).join(', '))}" placeholder="Empty = any country" autocomplete="off">
+          <span class="help">Two-letter country codes, separated by commas (MD = Moldova, SA = Saudi Arabia). Checked on every request, so a learner who travels or turns on a VPN is signed out. Leave empty to allow every country.${c.geo_countries?.length ? ` Now: ${esc(countryList(c.geo_countries))}.` : ''}</span></label>
         <label class="choice"><input type="checkbox" name="admins_exempt" ${c.admins_exempt ? 'checked' : ''}><span><b>Admins are exempt</b><small>Recommended, so you can't lock yourself out.</small></span></label>
         <div class="row-between" style="margin-top:12px"><span class="muted small">Last changed ${fmtDate(c.updated_at)}</span><button class="btn primary">Save rules</button></div>
       </form>
@@ -2642,6 +2649,13 @@ async function renderAdminSecurity() {
     ev.preventDefault();
     const patch = { one_device: f.one_device.checked, idle_minutes: +f.idle_minutes.value, max_session_hours: +f.max_session_hours.value,
       country_lock_hours: +f.country_lock_hours.value, admins_exempt: f.admins_exempt.checked, updated_at: new Date().toISOString() };
+    if (f.geo_countries) {
+      const codes = [...new Set(f.geo_countries.value.toUpperCase().split(/[\s,;]+/).filter(Boolean))];
+      const bad = codes.filter((x) => !/^[A-Z]{2}$/.test(x));
+      if (bad.length) { toast(`Not a two-letter country code: ${bad.join(', ')}`, 'bad'); return; }
+      patch.geo_countries = codes;
+      if (codes.length && !patch.admins_exempt && !confirm(`Admins will also be limited to ${countryList(codes)}. If you are elsewhere, you will be locked out. Continue?`)) return;
+    }
     if (!patch.admins_exempt && !confirm('Admins will follow the same rules, including timeouts. Continue?')) return;
     try { check(await sb.from('security_settings').update(patch).eq('id', true)); toast('Rules saved. They apply to everyone straight away.', 'ok'); await heartbeat(false); renderAdminSecurity(); }
     catch (e) { toast(errMsg(e), 'bad'); }
