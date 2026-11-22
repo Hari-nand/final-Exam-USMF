@@ -1,0 +1,22 @@
+name: SRI check (temporary)
+on:
+  push:
+    branches: [sri-check-tmp]
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compare integrity hashes in index.html with the real CDN files
+        run: |
+          set -e
+          fail=0
+          grep -oE 'src="https://cdn\.jsdelivr\.net/[^"]+"[^>]*integrity="sha256-[^"]+"' index.html | while read -r tag; do
+            url=$(echo "$tag" | sed -E 's/.*src="([^"]+)".*/\1/')
+            want=$(echo "$tag" | sed -E 's/.*integrity="sha256-([^"]+)".*/\1/')
+            got=$(curl -fsSL "$url" | openssl dgst -sha256 -binary | openssl base64 -A)
+            echo "$url"; echo "  expected $want"; echo "  actual   $got"
+            if [ "$want" = "$got" ]; then echo "  MATCH"; else echo "  MISMATCH"; echo bad >> /tmp/fail; fi
+          done
+          n=$(grep -cE 'integrity="sha256-' index.html); echo "tags: $n"
+          test ! -f /tmp/fail
