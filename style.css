@@ -502,3 +502,13 @@ table.kv td { overflow-wrap: anywhere; }
 .gate-notice { border: 1px solid var(--line); border-radius: var(--radius); padding: 16px; background: var(--surface-2); }
 .gate-notice h2 { font-size: 1.1rem; margin: 0 0 6px; }
 .gate-notice.done { opacity: .6; }
+
+/* Two-step sign-in */
+.otp { font-size: 1.6rem; letter-spacing: .35em; text-align: center; font-variant-numeric: tabular-nums; max-width: 240px; }
+.mfa-steps { padding-left: 1.2em; display: grid; gap: 12px; }
+.qr { background: #fff; border: 1px solid var(--line); border-radius: var(--radius-sm); padding: 12px; width: fit-content; margin: 10px 0; }
+.qr img { display: block; }
+.secret { font-size: 1rem; letter-spacing: .05em; word-break: break-all; }
+.mfa-list { list-style: none; padding: 0; display: grid; gap: 8px; margin: 12px 0; }
+.mfa-list li { display: flex; justify-content: space-between; align-items: center; gap: 12px; border: 1px solid var(--line); border-radius: var(--radius-sm); padding: 10px 12px; }
+.auth .otp, .notice .otp { margin: 0 auto; display: block; }

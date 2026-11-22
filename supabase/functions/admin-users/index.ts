@@ -1,8 +1,8 @@
 // Admin-only actions that need Supabase's secret key, which must never reach
 // the browser: creating learner accounts and setting passwords.
-// The caller must be signed in as an active admin (checked below).
-// Only the app's own site may call this from a browser, and every action is
-// written to public.admin_audit.
+// The caller must be signed in as an active admin (checked below), with their
+// authenticator code entered if they have one. Only the app's own site may call
+// this from a browser, and every action is written to public.admin_audit.
 import { createClient } from 'npm:@supabase/supabase-js@2';
 
 const ALLOWED_ORIGINS = new Set(['https://exam.anyms.bid']);
@@ -57,6 +57,20 @@ Deno.serve(async (req) => {
   if (!me || me.role !== 'admin' || !me.active) {
     await audit(user.id, 'edge.denied', user.id, { reason: 'not an active admin' });
     return json({ error: 'Admins only' }, 403);
+  }
+
+  // 2b. Admins with an authenticator must have entered a code in this sign-in (aal2).
+  let aal = 'aal1';
+  try {
+    const b64 = token.split('.')[1].replace(/-/g, '+').replace(/_/g, '/');
+    aal = JSON.parse(atob(b64 + '='.repeat((4 - (b64.length % 4)) % 4))).aal ?? 'aal1';
+  } catch { /* token already verified above; treat as aal1 */ }
+  if (aal !== 'aal2') {
+    const { data: f } = await admin.auth.admin.mfa.listFactors({ userId: user.id });
+    if ((f?.factors ?? []).some((x) => x.status === 'verified')) {
+      await audit(user.id, 'edge.denied', user.id, { reason: 'authenticator code not entered' });
+      return json({ error: 'Enter your authenticator code first.' }, 403);
+    }
   }
 
   let body: Record<string, unknown>;

@@ -519,6 +519,106 @@ function renderDeviceConsent() {
   };
 }
 
+/* =========================================================================
+   Two-step sign-in (authenticator app) for admins.
+   Admins without an authenticator must set one up at sign-in; admins with one
+   enter a 6-digit code. The database refuses admin powers without it (aal2).
+   ========================================================================= */
+const MFA_ISSUER = 'USMF Exam Prep';
+async function mfaFactors() {
+  const { data, error } = await sb.auth.mfa.listFactors();
+  if (error) throw error;
+  return { verified: (data.totp || []).filter((f) => f.status === 'verified'), all: data.all || [] };
+}
+/** Returns true when it has drawn a screen (setup or code) and the router should stop. */
+async function adminMfaGate() {
+  if (state.profile.role !== 'admin' || state.mfaOk) return false;
+  const { data, error } = await sb.auth.mfa.getAuthenticatorAssuranceLevel();
+  if (error) { console.warn(error); state.mfaOk = true; return false; } // the database still enforces it
+  if (data.currentLevel === 'aal2') { state.mfaOk = true; return false; }
+  if (data.nextLevel === 'aal2') { renderMfaCode(); return true; }
+  renderMfaSetup({ compulsory: true }); return true;
+}
+const codeField = `<label class="field">6-digit code<input name="code" inputmode="numeric" autocomplete="one-time-code" maxlength="9" required class="otp" placeholder="123456"></label>`;
+const cleanCode = (v) => String(v || '').replace(/\D/g, '').slice(0, 6);
+
+async function renderMfaCode() {
+  let factors = [];
+  try { factors = (await mfaFactors()).verified; } catch (e) { console.warn(e); }
+  $app.innerHTML = `
+    <main class="auth-wrap" id="view" tabindex="-1">
+      <form class="card auth" id="mfaForm" novalidate>
+        <div class="brand"><span class="mark">${icon('shield')}</span>${esc(APP_NAME)}</div>
+        <h1>Enter your code</h1>
+        <p class="muted">Open your authenticator app (for example Google Authenticator) and type the 6-digit code for ${esc(MFA_ISSUER)}.</p>
+        ${factors.length > 1 ? `<label class="field">Authenticator<select name="factor">${factors.map((f) => `<option value="${esc(f.id)}">${esc(f.friendly_name || 'Authenticator')}</option>`).join('')}</select></label>` : ''}
+        ${codeField}
+        <button class="btn primary lg" type="submit">${icon('check')}Verify</button>
+        <button class="btn ghost" type="button" id="mfaOut">${icon('logout')}Sign out</button>
+        <p class="form-error" id="mfaErr" role="alert"></p>
+        <p class="muted small">Lost your phone? Use your backup authenticator if you added one. Otherwise the authenticator can be reset in the Supabase dashboard.</p>
+      </form>
+    </main>`;
+  const f = document.getElementById('mfaForm'); f.code.focus();
+  f.querySelector('#mfaOut').onclick = () => signOutNow();
+  f.onsubmit = async (ev) => {
+    ev.preventDefault();
+    const code = cleanCode(f.code.value); const err = f.querySelector('#mfaErr');
+    if (code.length !== 6) { err.textContent = 'Type the 6 digits from your authenticator app.'; f.code.focus(); return; }
+    const factorId = f.factor ? f.factor.value : factors[0]?.id;
+    if (!factorId) { err.textContent = 'No authenticator found on this account. Sign out and in again.'; return; }
+    const btn = f.querySelector('[type=submit]'); btn.disabled = true;
+    const { error } = await sb.auth.mfa.challengeAndVerify({ factorId, code });
+    if (error) { btn.disabled = false; f.code.value = ''; f.code.focus(); err.textContent = /invalid|expired/i.test(error.message) ? 'That code is wrong or has expired. Wait for the next code and try again.' : error.message; return; }
+    state.mfaOk = true; reportCache.at = 0;
+    if (!location.hash || location.hash === '#/login') location.hash = '#/home'; else router();
+  };
+}
+
+/** Set up an authenticator. compulsory = the first one at sign-in; otherwise a backup from Account. */
+async function renderMfaSetup({ compulsory = false } = {}) {
+  const host = compulsory ? $app : shell('account', loading);
+  try {
+    for (const f of (await mfaFactors()).all.filter((x) => x.status !== 'verified')) await sb.auth.mfa.unenroll({ factorId: f.id });
+  } catch (e) { console.warn(e); }
+  const name = `${compulsory ? 'Authenticator' : 'Backup'} ${new Date().toISOString().slice(0, 16).replace('T', ' ')}`;
+  const { data, error } = await sb.auth.mfa.enroll({ factorType: 'totp', friendlyName: name, issuer: MFA_ISSUER });
+  const body = error ? `<p class="form-error">${esc(errMsg(error))}</p>` : `
+        <ol class="mfa-steps">
+          <li><b>Install an authenticator app</b> on your phone, such as Google Authenticator or Microsoft Authenticator.</li>
+          <li><b>Scan this QR code</b> with the app (tap + then Scan a QR code).
+            <div class="qr"><img src="${esc(data.totp.qr_code)}" alt="QR code to add ${esc(MFA_ISSUER)} to your authenticator app" width="200" height="200"></div>
+            <details><summary class="small">Can't scan? Enter this key instead</summary><p class="mono secret">${esc(data.totp.secret.replace(/(.{4})/g, '$1 ').trim())}</p></details></li>
+          <li><b>Type the 6-digit code</b> the app now shows for ${esc(MFA_ISSUER)}.</li>
+        </ol>
+        ${codeField}
+        <div class="btn-row"><button class="btn primary" type="submit">${icon('check')}Turn on two-step sign-in</button>
+          ${compulsory ? `<button class="btn ghost" type="button" id="mfaOut">${icon('logout')}Sign out</button>` : '<a class="btn ghost" href="#/account">Cancel</a>'}</div>
+        <p class="form-error" id="mfaErr" role="alert"></p>`;
+  const html = `<form class="card ${compulsory ? 'notice' : ''}" id="mfaSetup" novalidate>
+        ${compulsory ? `<div class="brand"><span class="mark">${icon('shield')}</span>${esc(APP_NAME)}</div>` : ''}
+        <h1>${compulsory ? 'Set up two-step sign-in' : 'Add a backup authenticator'}</h1>
+        <p class="muted">${compulsory ? 'Admin accounts now need a code from an authenticator app at every sign-in. Set it up once to continue.' : 'Add the same account to a second phone or a password manager, so you can still sign in if you lose your main phone.'}</p>
+        ${body}
+      </form>`;
+  if (compulsory) host.innerHTML = `<main class="auth-wrap" id="view" tabindex="-1">${html}</main>`; else host.innerHTML = html;
+  const f = document.getElementById('mfaSetup');
+  f.querySelector('#mfaOut')?.addEventListener('click', () => signOutNow());
+  if (error) return;
+  f.code.focus();
+  f.onsubmit = async (ev) => {
+    ev.preventDefault();
+    const code = cleanCode(f.code.value); const err = f.querySelector('#mfaErr');
+    if (code.length !== 6) { err.textContent = 'Type the 6 digits from your authenticator app.'; f.code.focus(); return; }
+    const btn = f.querySelector('[type=submit]'); btn.disabled = true;
+    const { error: e2 } = await sb.auth.mfa.challengeAndVerify({ factorId: data.id, code });
+    if (e2) { btn.disabled = false; f.code.value = ''; err.textContent = /invalid|expired/i.test(e2.message) ? 'That code is wrong or has expired. Check the app and try the new code.' : e2.message; return; }
+    state.mfaOk = true; reportCache.at = 0;
+    toast(compulsory ? 'Two-step sign-in is on. You will be asked for a code at every sign-in.' : 'Backup authenticator added.', 'ok');
+    if (compulsory) { if (!location.hash || location.hash === '#/login') location.hash = '#/home'; else router(); } else location.hash = '#/account';
+  };
+}
+
 /** Unread notices, shown before the app. Each needs Got it; the app opens once all are acknowledged. */
 function renderNoticeGate(list) {
   const first = (state.profile.full_name || '').split(' ')[0];
@@ -652,6 +752,7 @@ let lastRoute = '';
 async function router() {
   if (!state.profile) return renderLogin();
   if (Date.now() - SEC.lastBeat > 30000 && !(await heartbeat(SEC.lastActivity > SEC.lastBeat, true))) return;
+  if (await adminMfaGate()) return;
   if (needsNotice()) return renderNotice();
   if (needsDeviceConsent()) return renderDeviceConsent();
   recordDevice();
@@ -671,6 +772,8 @@ async function router() {
     route = 'exam/' + parts[1];
   } else if (route === 'feedback') {
     param = parts[1];
+  } else if (route === 'account' && parts[1] === 'backup') {
+    if (state.profile.role === 'admin') return renderMfaSetup();
   }
   if (route === 'login') { location.hash = '#/home'; return; }
   const fn = routes[route] || renderHome;
@@ -2490,7 +2593,9 @@ function renderAccount() {
         <button class="btn primary" type="submit">Update password</button>
         <p class="form-error" id="pwErr" role="alert"></p>
       </form>
-    </div>`);
+    </div>
+    ${p.role === 'admin' ? '<section class="card" id="mfaCard"><h2>Two-step sign-in</h2><p class="muted">Loading…</p></section>' : ''}`);
+  if (p.role === 'admin') paintMfaCard(view.querySelector('#mfaCard'));
   const form = view.querySelector('#pwForm');
   form.onsubmit = async (ev) => {
     ev.preventDefault();
@@ -2504,6 +2609,24 @@ function renderAccount() {
     if (error) { err.textContent = error.message; return; }
     form.reset(); toast('Password updated.', 'ok');
   };
+}
+
+async function paintMfaCard(card) {
+  let list = [];
+  try { list = (await mfaFactors()).verified; } catch (e) { card.innerHTML = `<h2>Two-step sign-in</h2><p class="form-error">${esc(errMsg(e))}</p>`; return; }
+  card.innerHTML = `<h2>${icon('shield')}Two-step sign-in</h2>
+    <p class="muted">${list.length ? 'On. Every admin sign-in needs a 6-digit code from one of these authenticators.' : 'Off. You will be asked to set it up at your next sign-in.'}</p>
+    ${list.length ? `<ul class="mfa-list">${list.map((f) => `<li><span><b>${esc(f.friendly_name || 'Authenticator')}</b><br><span class="muted small">Added ${esc(fmtDate(f.created_at))}</span></span>
+      ${list.length > 1 ? `<button class="btn sm danger" type="button" data-unenroll="${esc(f.id)}">Remove</button>` : '<span class="muted small">Add a backup before removing this one</span>'}</li>`).join('')}</ul>` : ''}
+    <div class="btn-row"><a class="btn" href="#/account/backup">${icon('shield')}Add a backup authenticator</a></div>`;
+  card.querySelectorAll('[data-unenroll]').forEach((b) => (b.onclick = async () => {
+    if (!confirm('Remove this authenticator? Its codes will stop working.')) return;
+    b.disabled = true;
+    const { error } = await sb.auth.mfa.unenroll({ factorId: b.dataset.unenroll });
+    if (error) { b.disabled = false; toast(errMsg(error), 'bad'); return; }
+    await sb.auth.refreshSession().catch(() => {});
+    toast('Authenticator removed.', 'ok'); paintMfaCard(card);
+  }));
 }
 
 /* =========================================================================
@@ -3392,7 +3515,7 @@ async function renderAdminQuestions() {
       if (!SEC.leaving && !state.flash) state.flash = 'You were signed out. This happens when your account is signed in on another device or your session ends.';
       stopSecurityTimers();
       clearInterval(state.timer);
-      Object.assign(state, { profile: null, meta: null, run: null, exam: null, examResult: null, drafts: null, noticesOk: false });
+      Object.assign(state, { profile: null, meta: null, run: null, exam: null, examResult: null, drafts: null, noticesOk: false, mfaOk: false });
       document.getElementById('toasts').replaceChildren();
       setTimeout(() => (location.hash === '' || location.hash === '#/login' ? router() : (location.hash = '#/login')), 0);
     }
