@@ -1369,7 +1369,7 @@ async function renderAdminReports() {
       <ul class="reps">${g.reps.map((r) => repLine(r, q)).join('')}</ul>
       <div class="qedit"></div>
       ${open ? `<div class="resolve">
-        <label class="field" style="margin:12px 0 8px">Note to keep with the reports<span class="help">Admin only, e.g. what you changed. To answer a learner, use Reply on their report.</span><input type="text" maxlength="300" class="rnote"></label>
+        <label class="field" style="margin:12px 0 8px">Note to keep with the reports<span class="help">Admin only, e.g. what you changed. Learners never see it. To write to a learner, use Message / change status on their report.</span><input type="text" maxlength="300" class="rnote"></label>
         <div class="btn-row">${q ? `<button class="btn" data-act="edit">${icon('layers')}Edit question</button>` : ''}<button class="btn primary" data-act="fixed">${icon('check')}Close all as fixed</button><button class="btn ghost" data-act="no_change">Close all: no change needed</button></div>
         <p class="muted small" style="margin:6px 0 0">Closing notifies each learner who reported this question.</p></div>` : ''}
     </li>`;
