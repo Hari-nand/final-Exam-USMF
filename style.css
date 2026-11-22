@@ -495,3 +495,10 @@ table.kv th { text-align: left; font-weight: 600; white-space: nowrap; width: 1%
 table.kv td { overflow-wrap: anywhere; }
 .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
 .ticket.device h3 { margin: 16px 0 6px; }
+
+/* Notices gate after sign-in */
+.gate .notice { max-width: 760px; }
+.gate-list { list-style: none; padding: 0; margin: 16px 0; display: grid; gap: 12px; }
+.gate-notice { border: 1px solid var(--line); border-radius: var(--radius); padding: 16px; background: var(--surface-2); }
+.gate-notice h2 { font-size: 1.1rem; margin: 0 0 6px; }
+.gate-notice.done { opacity: .6; }

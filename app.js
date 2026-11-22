@@ -519,6 +519,45 @@ function renderDeviceConsent() {
   };
 }
 
+/** Unread notices, shown before the app. Each needs Got it; the app opens once all are acknowledged. */
+function renderNoticeGate(list) {
+  const first = (state.profile.full_name || '').split(' ')[0];
+  const left = () => $app.querySelectorAll('.gate-notice:not(.done)').length;
+  $app.innerHTML = `
+    <main class="auth-wrap gate" id="view" tabindex="-1">
+      <div class="card notice">
+        <div class="brand"><span class="mark">${icon('bell')}</span>${esc(APP_NAME)}</div>
+        <h1>New notices</h1>
+        <p class="muted">${first ? `${esc(first)}, please` : 'Please'} read ${list.length === 1 ? 'this notice' : `these ${list.length} notices`} and press <b>Got it</b> on each to continue to your practice and mock exams.</p>
+        <p class="chip warn" id="gateLeft" role="status">${list.length} to read</p>
+        <ol class="gate-list">${list.map((u) => `<li class="gate-notice" data-id="${esc(u.id)}">
+          <h2>${esc(u.title)}</h2>${noticeBody(u)}
+          <div class="row-between"><span class="muted small">Issued by <b>${esc(u.issuer || NOTICE_ISSUER)}</b> · ${esc(longDate(u.show_from))}</span>
+            <button class="btn primary sm" type="button" data-ack="${esc(u.id)}">${icon('check')}Got it</button></div></li>`).join('')}</ol>
+        <div class="btn-row">
+          ${list.length > 1 ? `<button class="btn primary" type="button" id="ackAll">${icon('check')}I have read all of them</button>` : ''}
+          <button class="btn ghost" type="button" id="gateOut">${icon('logout')}Sign out</button>
+        </div>
+        <p class="form-error" id="gateErr" role="alert"></p>
+      </div>
+    </main>`;
+  document.getElementById('view').focus({ preventScroll: true });
+  const save = async (ids) => {
+    const { error } = await sb.from('notice_reads').upsert(ids.map((id) => ({ announcement_id: id, user_id: state.profile.id })), { onConflict: 'announcement_id,user_id', ignoreDuplicates: true });
+    if (error && !missingInDb(error)) throw error;
+    const seen = store.get(updatesKey()) || []; ids.forEach((id) => { if (!seen.includes(id)) seen.push(id); state.noticeReads?.add(id); }); store.set(updatesKey(), seen);
+    ids.forEach((id) => { const li = $app.querySelector(`.gate-notice[data-id="${CSS.escape(id)}"]`); if (li) { li.classList.add('done'); const b = li.querySelector('[data-ack]'); b.disabled = true; b.innerHTML = `${icon('check')}Acknowledged`; } });
+    const n = left(); const lab = $app.querySelector('#gateLeft');
+    if (lab) lab.textContent = n ? `${n} to read` : 'All read';
+    if (!n) { state.noticesOk = true; bellCache.at = 0; if (!location.hash || location.hash === '#/login') location.hash = '#/home'; else router(); }
+  };
+  const fail = (e) => { $app.querySelector('#gateErr').textContent = errMsg(e); };
+  $app.querySelectorAll('[data-ack]').forEach((b) => (b.onclick = () => { b.disabled = true; save([b.dataset.ack]).catch((e) => { b.disabled = false; fail(e); }); }));
+  const all = $app.querySelector('#ackAll');
+  if (all) all.onclick = () => { all.disabled = true; save([...$app.querySelectorAll('.gate-notice:not(.done)')].map((li) => li.dataset.id)).catch((e) => { all.disabled = false; fail(e); }); };
+  $app.querySelector('#gateOut').onclick = () => signOutNow();
+}
+
 async function renderNotice() {
   const { data } = await sb.rpc('security_summary');
   const r = data || { one_device: true, idle_minutes: SEC.idle, max_session_hours: SEC.max, country_lock_hours: 0 };
@@ -616,6 +655,12 @@ async function router() {
   if (needsNotice()) return renderNotice();
   if (needsDeviceConsent()) return renderDeviceConsent();
   recordDevice();
+  // Learners read and acknowledge every live notice before using the app (checked once per sign-in).
+  if (state.profile.role !== 'admin' && !state.noticesOk) {
+    const unread = await unreadNoticeList(true).catch(() => []);
+    if (unread.length) return renderNoticeGate(unread);
+    state.noticesOk = true;
+  }
   const parts = location.hash.replace(/^#\/?/, '').split('/').filter(Boolean);
   let route = parts[0] || 'home';
   let param;
@@ -3347,7 +3392,7 @@ async function renderAdminQuestions() {
       if (!SEC.leaving && !state.flash) state.flash = 'You were signed out. This happens when your account is signed in on another device or your session ends.';
       stopSecurityTimers();
       clearInterval(state.timer);
-      Object.assign(state, { profile: null, meta: null, run: null, exam: null, examResult: null, drafts: null });
+      Object.assign(state, { profile: null, meta: null, run: null, exam: null, examResult: null, drafts: null, noticesOk: false });
       document.getElementById('toasts').replaceChildren();
       setTimeout(() => (location.hash === '' || location.hash === '#/login' ? router() : (location.hash = '#/login')), 0);
     }
