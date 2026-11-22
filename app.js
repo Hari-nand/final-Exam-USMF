@@ -399,11 +399,124 @@ function noticeItems(r) {
   if (r.geo_countries?.length) items.push(['alert', 'Where you can use the app', `The app can only be used from ${countryList(r.geo_countries)}. Sign-ins and activity from other countries, or through a VPN that hides your country, are blocked.`]);
   if (r.country_lock_hours) items.push(['alert', 'Location check', `A sign-in from a different country within ${r.country_lock_hours} hours of your last sign-in is blocked. If you travel, ask the admin to allow it.`]);
   items.push(
+    ['shield', 'Device check', 'With your permission, the app recognises the devices you use (browser, system, screen, hardware and a device fingerprint) and saves a cookie with a random device ID. Only the admin can see this.'],
     ['eye', 'What is recorded', 'For each sign-in we record the time, your device and browser, your approximate country and your IP address. This is used only to protect accounts, is visible only to the admin, and is deleted after 90 days. Your answers and progress are also visible to the admin.'],
     ['x', 'If an account is shared', 'Accounts that show signs of sharing may be signed out or deactivated.'],
     ['book', 'Question content', 'The questions are for your personal study. Do not copy, sell or redistribute them.'],
   );
   return items;
+}
+
+/* =========================================================================
+   Device check & cookies: everyone consents once (again if the version goes up).
+   Required to use the app. The device details help the admin spot shared accounts.
+   ========================================================================= */
+const DEVICE_CONSENT_VERSION = 1;
+const needsDeviceConsent = () => !!state.profile && 'device_consent_version' in state.profile && (state.profile.device_consent_version || 0) < DEVICE_CONSENT_VERSION;
+const getCookie = (n) => (document.cookie.split('; ').find((c) => c.startsWith(n + '=')) || '').split('=').slice(1).join('=') || null;
+const setCookie = (n, v) => { document.cookie = `${n}=${v}; Max-Age=31536000; Path=/; SameSite=Strict${location.protocol === 'https:' ? '; Secure' : ''}`; };
+const hex = (buf) => [...new Uint8Array(buf)].map((b) => b.toString(16).padStart(2, '0')).join('');
+const sha256 = async (text) => hex(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text)));
+
+async function deviceDetails() {
+  const n = navigator; const scr = window.screen || {};
+  let gpu = null, canvas = null;
+  try {
+    const gl = document.createElement('canvas').getContext('webgl');
+    const ext = gl && gl.getExtension('WEBGL_debug_renderer_info');
+    if (gl) gpu = ext ? `${gl.getParameter(ext.UNMASKED_VENDOR_WEBGL)} · ${gl.getParameter(ext.UNMASKED_RENDERER_WEBGL)}` : gl.getParameter(gl.RENDERER);
+  } catch { /* not available */ }
+  try {
+    const c = document.createElement('canvas'); c.width = 220; c.height = 40; const x = c.getContext('2d');
+    x.textBaseline = 'top'; x.font = '16px Arial'; x.fillStyle = '#0e7490'; x.fillRect(0, 0, 220, 40); x.fillStyle = '#fbbf24'; x.fillText('USMF exam prep ✓ 2026', 4, 10);
+    canvas = (await sha256(c.toDataURL())).slice(0, 16);
+  } catch { /* blocked */ }
+  let hi = {};
+  try { if (n.userAgentData?.getHighEntropyValues) hi = await n.userAgentData.getHighEntropyValues(['platformVersion', 'model', 'architecture', 'bitness', 'fullVersionList']); } catch { /* refused */ }
+  const d = {
+    browser_os: deviceLabel(), user_agent: n.userAgent, platform: n.userAgentData?.platform || n.platform || null,
+    mobile: n.userAgentData ? n.userAgentData.mobile : /Mobi|Android|iPhone|iPad/i.test(n.userAgent),
+    model: hi.model || null, os_version: hi.platformVersion || null, architecture: [hi.architecture, hi.bitness].filter(Boolean).join(' ') || null,
+    browser_versions: hi.fullVersionList ? hi.fullVersionList.map((b) => `${b.brand} ${b.version}`).join(', ') : null,
+    screen: `${scr.width}×${scr.height}`, pixel_ratio: window.devicePixelRatio || 1, colour_depth: scr.colorDepth || null,
+    languages: (n.languages || [n.language]).join(', '), time_zone: Intl.DateTimeFormat().resolvedOptions().timeZone || null,
+    cpu_cores: n.hardwareConcurrency || null, memory_gb: n.deviceMemory || null, touch_points: n.maxTouchPoints || 0,
+    gpu, canvas, cookies_enabled: n.cookieEnabled, do_not_track: n.doNotTrack || null,
+    connection: n.connection?.effectiveType || null, installed_app: window.matchMedia?.('(display-mode: standalone)').matches || false,
+  };
+  // The fingerprint uses only things that stay the same on this device (not the cookie, so clearing it doesn't change it).
+  const stable = [d.user_agent, d.platform, d.model, d.os_version, d.architecture, d.screen, d.pixel_ratio, d.colour_depth, d.languages, d.time_zone, d.cpu_cores, d.memory_gb, d.touch_points, d.gpu, d.canvas].join('|');
+  return { details: d, fingerprint: await sha256(stable) };
+}
+/** Everything the app finds stored in this browser for the site. Sign-in tokens and keys are hidden. */
+function storageSnapshot() {
+  const out = []; let size = 0;
+  const hide = (name, value) => /auth|token|secret|password|api.?key|session/i.test(name) || /(^|[^A-Za-z0-9])eyJ[A-Za-z0-9_-]{10,}\./.test(value);
+  const add = (area, name, value) => {
+    value = String(value ?? '');
+    const v = hide(name, value) ? '[hidden]' : value.length > 300 ? value.slice(0, 300) + '…' : value;
+    size += name.length + v.length; if (size > 20000) return;
+    out.push({ area, name: name.slice(0, 120), value: v });
+  };
+  try { for (let i = 0; i < localStorage.length; i++) { const k = localStorage.key(i); add('localStorage', k, localStorage.getItem(k)); } } catch { /* blocked */ }
+  try { for (let i = 0; i < sessionStorage.length; i++) { const k = sessionStorage.key(i); add('sessionStorage', k, sessionStorage.getItem(k)); } } catch { /* blocked */ }
+  for (const c of document.cookie ? document.cookie.split('; ') : []) { const i = c.indexOf('='); add('cookie', c.slice(0, i), decodeURIComponent(c.slice(i + 1))); }
+  return out;
+}
+let deviceRecorded = false;
+async function recordDevice(force = false) {
+  if ((deviceRecorded && !force) || !state.profile || needsDeviceConsent()) return;
+  deviceRecorded = true;
+  try {
+    let id = getCookie('usmf_device');
+    if (!/^[0-9a-f-]{36}$/.test(id || '')) { id = crypto.randomUUID(); setCookie('usmf_device', id); }
+    const { details, fingerprint } = await deviceDetails();
+    details.device_cookie = id;
+    const { error } = await sb.rpc('record_device', { p_fingerprint: fingerprint, p_device_id: id, p_label: deviceLabel(), p_details: details, p_storage: storageSnapshot() });
+    if (error && !missingInDb(error)) console.warn(error);
+  } catch (e) { console.warn(e); }
+}
+
+function renderDeviceConsent() {
+  const first = (state.profile.full_name || '').split(' ')[0];
+  const items = [
+    ['shield', 'Why we ask', 'To keep accounts personal, the app recognises the devices you use it on. This helps the admin spot an account being shared.'],
+    ['user', 'What is collected from your device', 'Your browser and operating system, device model, screen size, language, time zone, number of processor cores and memory, graphics card, and a device fingerprint built from these. We also record the approximate country and IP address of each visit.'],
+    ['book', 'Cookies and stored data', 'The app saves a cookie with a random device ID, and keeps your settings in the browser. The admin can see what the app stores on your device. Your password and sign-in details are always hidden.'],
+    ['eye', 'Who can see it', 'Only the admin. It is used only for account security and is deleted 90 days after you last use a device.'],
+    ['alert', 'Required', 'The device check is part of account security, so it is needed to use USMF Exam Prep. If you don\'t accept, you will be signed out.'],
+  ];
+  $app.innerHTML = `
+    <main class="auth-wrap" id="view" tabindex="-1">
+      <form class="card notice" id="devForm" aria-labelledby="dt" novalidate>
+        <div class="brand"><span class="mark">${icon('shield')}</span>${esc(APP_NAME)}</div>
+        <h1 id="dt">Device check and cookies</h1>
+        <p class="muted">${first ? `${esc(first)}, before` : 'Before'} you continue, we need your permission to recognise this device and to use cookies.</p>
+        <ol class="notice-list">${items.map(([ic, t, d]) => `<li>${icon(ic)}<div><b>${t}</b><p>${esc(d)}</p></div></li>`).join('')}</ol>
+        <p class="signed"><span>Issued by <b>${esc(NOTICE_ISSUER)}</b></span><span>Version ${DEVICE_CONSENT_VERSION}</span></p>
+        <label class="choice"><input type="checkbox" id="devAgree"><span><b>I allow the device check and cookies</b><small>Your choice is recorded with the date and time.</small></span></label>
+        <div class="btn-row">
+          <button class="btn primary lg" type="submit" id="devAccept" disabled>Allow and continue ${icon('right')}</button>
+          <button class="btn ghost" type="button" id="devDecline">${icon('logout')}Don't allow and sign out</button>
+        </div>
+        <p class="form-error" id="devErr" role="alert"></p>
+      </form>
+    </main>`;
+  const f = document.getElementById('devForm'); const agree = f.querySelector('#devAgree'); const btn = f.querySelector('#devAccept');
+  agree.onchange = () => { btn.disabled = !agree.checked; };
+  f.querySelector('#devDecline').onclick = async () => { state.flash = 'You need to allow the device check and cookies to use USMF Exam Prep. You can sign in again at any time and allow it.'; await signOutNow();
+    if (state.profile) { state.profile = null; if (location.hash === '#/login') router(); else location.hash = '#/login'; } };
+  document.getElementById('view').focus({ preventScroll: true });
+  f.onsubmit = async (ev) => {
+    ev.preventDefault(); if (!agree.checked) return;
+    btn.disabled = true; btn.textContent = 'Saving…';
+    const { error } = await sb.rpc('accept_device_consent', { p_version: DEVICE_CONSENT_VERSION });
+    if (error) { f.querySelector('#devErr').textContent = errMsg(error); btn.disabled = false; btn.innerHTML = `Allow and continue ${icon('right')}`; return; }
+    state.profile.device_consent_version = DEVICE_CONSENT_VERSION; state.profile.device_consent_at = new Date().toISOString();
+    setCookie('usmf_consent', String(DEVICE_CONSENT_VERSION));
+    await recordDevice(true);
+    if (!location.hash || location.hash === '#/login') location.hash = '#/home'; else router();
+  };
 }
 
 async function renderNotice() {
@@ -501,6 +614,8 @@ async function router() {
   if (!state.profile) return renderLogin();
   if (Date.now() - SEC.lastBeat > 30000 && !(await heartbeat(SEC.lastActivity > SEC.lastBeat, true))) return;
   if (needsNotice()) return renderNotice();
+  if (needsDeviceConsent()) return renderDeviceConsent();
+  recordDevice();
   const parts = location.hash.replace(/^#\/?/, '').split('/').filter(Boolean);
   let route = parts[0] || 'home';
   let param;
@@ -2600,11 +2715,12 @@ async function renderAdminSecurity() {
   const settingsRes = await sb.from('security_settings').select('*').maybeSingle();
   if (settingsRes.error && missingInDb(settingsRes.error)) { view.innerHTML = adminTabs('security') + notEnabledCard(); return; }
   const c = check(settingsRes);
-  const [profiles, events, active, audit] = await Promise.all([
+  const [profiles, events, active, audit, devRows] = await Promise.all([
     sb.from('profiles').select('id,full_name,email,role').then(check),
     loadLoginEvents(30),
     sb.from('user_sessions').select('session_id,user_id,device,ip,country,started_at,last_seen').is('ended_at', null).order('last_seen', { ascending: false }).then(check),
     sb.from('admin_audit').select('id,at,actor,action,target,detail').order('at', { ascending: false }).limit(100).then(({ data, error }) => (error ? null : data)),
+    sb.from('devices').select('user_id,fingerprint,device_id,label,last_seen').then(({ data, error }) => (error ? [] : data)),
   ]);
   const names = new Map(profiles.map((p) => [p.id, p.full_name || p.email]));
   const freshCut = Date.now() - Math.max(c.idle_minutes || 60, 5) * 60000;
@@ -2612,6 +2728,15 @@ async function renderAdminSecurity() {
   const seenCountries = [...new Set(events.filter((e) => e.country).map((e) => e.country))];
   const opt = (vals, cur, unit) => vals.map((v) => `<option value="${v}" ${v === cur ? 'selected' : ''}>${v === 0 ? 'Off' : `${v} ${unit}${v === 1 ? '' : 's'}`}</option>`).join('');
   const flagged = profiles.map((p) => ({ p, f: sharingFlags(events.filter((e) => e.user_id === p.id)) })).filter((x) => x.f.length);
+  // Devices that more than one account has used (same fingerprint or same device cookie)
+  const groups = new Map();
+  for (const d of devRows) for (const k of [d.fingerprint, d.device_id && 'c:' + d.device_id].filter(Boolean)) { if (!groups.has(k)) groups.set(k, []); groups.get(k).push(d); }
+  const sharedDevs = []; const seenSets = new Set();
+  for (const list of groups.values()) {
+    const users = [...new Set(list.map((d) => d.user_id))]; if (users.length < 2) continue;
+    const key = users.sort().join(','); if (seenSets.has(key)) continue; seenSets.add(key);
+    sharedDevs.push({ users, label: list[0].label, last: list.map((d) => d.last_seen).sort().pop() });
+  }
 
   view.innerHTML = `${adminTabs('security')}
     <h1>Security</h1>
@@ -2632,6 +2757,9 @@ async function renderAdminSecurity() {
         <h2>Possible account sharing <span class="muted small">(last 7 days)</span></h2>
         ${flagged.length ? `<ul class="flags">${flagged.map((x) => `<li><a href="#/admin/learner/${x.p.id}">${esc(x.p.full_name || x.p.email)}</a><br><span class="muted small">${esc(x.f.join(' · '))}</span></li>`).join('')}</ul>`
           : '<p class="muted">Nothing unusual. Learners are flagged here after repeated device take-overs, sign-ins from several countries or many devices, or blocked sign-ins.</p>'}
+        <h2 style="margin-top:24px">Devices used by more than one account</h2>
+        ${sharedDevs.length ? `<ul class="flags">${sharedDevs.map((x) => `<li>${icon('alert')} <b>${esc(x.label || 'A device')}</b> · last seen ${fmtDate(x.last)}<br>${x.users.map((u) => `<a href="#/admin/learner/${u}">${esc(names.get(u) || 'Unknown')}</a>`).join(', ')}</li>`).join('')}</ul>`
+          : '<p class="muted">None. A device shows up here when two or more accounts sign in on it (same fingerprint or same device cookie).</p>'}
         <h2 style="margin-top:24px">Signed in now</h2>
         ${online.length ? `<div class="table-wrap"><table><thead><tr><th>Learner</th><th>Device</th><th>Country</th><th>Last active</th><th></th></tr></thead><tbody>
           ${online.map((s) => `<tr><td>${esc(names.get(s.user_id) || '–')}</td><td>${esc(s.device || '–')}</td><td>${esc(s.country || '–')}</td><td>${fmtDate(s.last_seen)}</td>
@@ -2790,13 +2918,54 @@ async function renderAdminLearners() {
   };
 }
 
+/* Devices: one learner's devices, and which other accounts use the same device. */
+async function loadDevices(userId) {
+  const { data, error } = await sb.from('devices').select('*').eq('user_id', userId).order('last_seen', { ascending: false });
+  if (error) return missingInDb(error) ? null : [];
+  const fps = data.map((d) => d.fingerprint); const ids = data.map((d) => d.device_id).filter(Boolean);
+  let others = [];
+  if (fps.length) {
+    const [a, b] = await Promise.all([
+      sb.from('devices').select('user_id,fingerprint,device_id').in('fingerprint', fps).neq('user_id', userId),
+      ids.length ? sb.from('devices').select('user_id,fingerprint,device_id').in('device_id', ids).neq('user_id', userId) : { data: [] },
+    ]);
+    others = [...(a.data || []), ...(b.data || [])];
+  }
+  const uids = [...new Set(others.map((o) => o.user_id))];
+  const people = uids.length ? check(await sb.from('profiles').select('id,full_name,email').in('id', uids)) : [];
+  const name = new Map(people.map((x) => [x.id, x.full_name || x.email]));
+  return data.map((d) => ({ ...d, shared: [...new Set(others.filter((o) => o.fingerprint === d.fingerprint || (d.device_id && o.device_id === d.device_id)).map((o) => name.get(o.user_id) || 'Another account'))] }));
+}
+const DETAIL_LABELS = [['browser_os', 'Browser and system'], ['model', 'Device model'], ['os_version', 'System version'], ['architecture', 'Architecture'], ['screen', 'Screen'], ['pixel_ratio', 'Pixel ratio'], ['colour_depth', 'Colour depth'],
+  ['languages', 'Languages'], ['time_zone', 'Time zone'], ['cpu_cores', 'Processor cores'], ['memory_gb', 'Memory (GB)'], ['touch_points', 'Touch points'], ['gpu', 'Graphics'], ['connection', 'Connection'],
+  ['installed_app', 'Installed as app'], ['cookies_enabled', 'Cookies enabled'], ['do_not_track', 'Do Not Track'], ['device_cookie', 'Device cookie ID'], ['canvas', 'Canvas hash'], ['browser_versions', 'Browser versions'], ['user_agent', 'User agent']];
+function devicesCard(p, devs) {
+  if (devs === null) return '';
+  const consent = p.device_consent_version >= DEVICE_CONSENT_VERSION ? `${icon('check')} Allowed the device check and cookies ${fmtDate(p.device_consent_at)}.` : `${icon('alert')} Has not allowed the device check yet. They will be asked at their next sign-in.`;
+  const val = (v) => (v === null || v === undefined || v === '' ? '<span class="muted">–</span>' : esc(typeof v === 'boolean' ? (v ? 'Yes' : 'No') : String(v)));
+  return `<section class="card" aria-labelledby="devH"><h2 id="devH">${icon('shield')}Devices</h2>
+    <p class="small">${consent}</p>
+    ${!devs.length ? '<p class="muted">No devices recorded yet.</p>' : `<ol class="tickets">${devs.map((d) => { const x = d.details || {}; return `<li><details class="card ticket device">
+      <summary><div class="row-between"><span><b>${esc(d.label || x.browser_os || 'Device')}</b> <span class="muted small">${esc(x.screen || '')}${x.time_zone ? ' · ' + esc(x.time_zone) : ''}</span></span>
+        <span>${d.shared.length ? `<span class="chip bad">${icon('alert')}Also used by ${esc(d.shared.join(', '))}</span> ` : ''}<span class="chip">${d.times_seen} visit${d.times_seen === 1 ? '' : 's'}</span></span></div>
+        <span class="muted small">First seen ${esc(fmtDate(d.first_seen))} · last seen ${esc(fmtDate(d.last_seen))}${d.last_country ? ` from ${esc(countryName(d.last_country))}` : ''}${d.last_ip ? ` (${esc(d.last_ip)})` : ''} · fingerprint ${esc(d.fingerprint.slice(0, 12))}…</span></summary>
+      <h3 class="small">All details</h3>
+      <div class="table-wrap"><table class="kv"><tbody>${DETAIL_LABELS.filter(([k]) => k in x).map(([k, l]) => `<tr><th>${l}</th><td>${val(x[k])}</td></tr>`).join('')}
+        <tr><th>Fingerprint</th><td class="mono small">${esc(d.fingerprint)}</td></tr></tbody></table></div>
+      <h3 class="small">Cookies and stored data <span class="muted">(${(d.storage || []).length} items, sign-in tokens and keys hidden)</span></h3>
+      ${(d.storage || []).length ? `<div class="table-wrap"><table class="kv"><thead><tr><th>Where</th><th>Name</th><th>Value</th></tr></thead><tbody>${d.storage.map((it) => `<tr><td class="small">${esc(it.area)}</td><td class="mono small">${esc(it.name)}</td><td class="mono small">${it.value === '[hidden]' ? '<span class="chip">hidden</span>' : esc(it.value)}</td></tr>`).join('')}</tbody></table></div>` : '<p class="muted small">Nothing stored.</p>'}
+    </details></li>`; }).join('')}</ol>`}
+  </section>`;
+}
+
 async function renderAdminLearner(id) {
   const view = shell('admin', loading);
   const p = check(await sb.from('profiles').select('*').eq('id', id).maybeSingle());
   if (!p) { view.innerHTML = `${adminTabs('learners')}<div class="card empty"><p>Learner not found.</p><a class="btn" href="#/admin/learners">Back</a></div>`; return; }
   const self = p.id === state.profile.id;
-  const [{ html, sessions }, events, secSettings] = await Promise.all([progressHTML(id), loadLoginEvents(30, id),
-    sb.from('security_settings').select('country_lock_hours').maybeSingle().then((r) => r.data, () => null)]);
+  const [{ html, sessions }, events, secSettings, devs] = await Promise.all([progressHTML(id), loadLoginEvents(30, id),
+    sb.from('security_settings').select('country_lock_hours').maybeSingle().then((r) => r.data, () => null),
+    loadDevices(id)]);
   const flags = events ? sharingFlags(events) : [];
   const lockOn = secSettings && secSettings.country_lock_hours > 0;
   const allowed = p.location_ok_until && new Date(p.location_ok_until) > new Date();
@@ -2818,7 +2987,8 @@ async function renderAdminLearner(id) {
         ${self ? '' : '<button class="btn sm" id="signOutAll">Sign out of all devices</button>'}</div></div>
       ${'notice_version' in p ? `<p class="small">${p.notice_version >= NOTICE_VERSION ? `${icon('check')} Accepted the security notice (version ${p.notice_version}) ${fmtDate(p.notice_accepted_at)}.` : `${icon('alert')} Has not accepted the security notice yet. They will be asked at their next sign-in.`}</p>` : ''}
       ${flags.length ? `<p class="chip bad">${icon('alert')}Possible sharing in the last 7 days: ${esc(flags.join(' · '))}</p>` : '<p class="muted small">No signs of account sharing in the last 7 days.</p>'}
-      ${eventsTable(events.slice(0, 30))}</section>` : ''}`;
+      ${eventsTable(events.slice(0, 30))}</section>` : ''}
+    ${devicesCard(p, devs)}`;
   drawCurveInto(view.querySelector('#curve'), sessions);
   const so = view.querySelector('#signOutAll');
   if (so) so.onclick = async () => {
