@@ -1,16 +1,21 @@
 // Admin-only actions that need Supabase's secret key, which must never reach
 // the browser: creating learner accounts and setting passwords.
 // The caller must be signed in as an active admin (checked below).
+// Only the app's own site may call this from a browser, and every action is
+// written to public.admin_audit.
 import { createClient } from 'npm:@supabase/supabase-js@2';
 
-const cors = {
-  'Access-Control-Allow-Origin': '*',
-  'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type',
-  'Access-Control-Allow-Methods': 'POST, OPTIONS',
-};
+const ALLOWED_ORIGINS = new Set(['https://exam.anyms.bid']);
 
-const json = (body: unknown, status = 200) =>
-  new Response(JSON.stringify(body), { status, headers: { ...cors, 'Content-Type': 'application/json' } });
+function corsFor(origin: string | null): Record<string, string> {
+  const h: Record<string, string> = {
+    'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type',
+    'Access-Control-Allow-Methods': 'POST, OPTIONS',
+    'Vary': 'Origin',
+  };
+  if (origin && ALLOWED_ORIGINS.has(origin)) h['Access-Control-Allow-Origin'] = origin;
+  return h;
+}
 
 // Prefer the new named secret key, fall back to the legacy service_role key.
 function secretKey(): string {
@@ -25,7 +30,19 @@ const admin = createClient(Deno.env.get('SUPABASE_URL')!, secretKey(), {
   auth: { persistSession: false, autoRefreshToken: false },
 });
 
+async function audit(actor: string | null, action: string, target: string | null, detail: Record<string, unknown> | null = null) {
+  const { error } = await admin.from('admin_audit').insert({ actor, action, target, detail });
+  if (error) console.error('audit failed', action, error.message);
+}
+
 Deno.serve(async (req) => {
+  const origin = req.headers.get('Origin');
+  const cors = corsFor(origin);
+  const json = (body: unknown, status = 200) =>
+    new Response(JSON.stringify(body), { status, headers: { ...cors, 'Content-Type': 'application/json' } });
+
+  // Browsers always send Origin on these calls; refuse any site other than ours.
+  if (origin && !ALLOWED_ORIGINS.has(origin)) return json({ error: 'Origin not allowed' }, 403);
   if (req.method === 'OPTIONS') return new Response('ok', { headers: cors });
   if (req.method !== 'POST') return json({ error: 'Method not allowed' }, 405);
 
@@ -37,19 +54,22 @@ Deno.serve(async (req) => {
 
   // 2. Are they an active admin?
   const { data: me } = await admin.from('profiles').select('role, active').eq('id', user.id).maybeSingle();
-  if (!me || me.role !== 'admin' || !me.active) return json({ error: 'Admins only' }, 403);
+  if (!me || me.role !== 'admin' || !me.active) {
+    await audit(user.id, 'edge.denied', user.id, { reason: 'not an active admin' });
+    return json({ error: 'Admins only' }, 403);
+  }
 
   let body: Record<string, unknown>;
   try { body = await req.json(); } catch { return json({ error: 'Bad request' }, 400); }
 
   // 3. Do the action.
   if (body.action === 'create_user') {
-    const email = String(body.email ?? '').trim().toLowerCase();
-    const full_name = String(body.full_name ?? '').trim() || null;
+    const email = String(body.email ?? '').trim().toLowerCase().slice(0, 254);
+    const full_name = String(body.full_name ?? '').trim().slice(0, 120) || null;
     const role = body.role === 'admin' ? 'admin' : 'learner';
     const password = String(body.password ?? '');
     if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) return json({ error: 'Enter a valid email address.' }, 400);
-    if (password.length < 8) return json({ error: 'Password must be at least 8 characters.' }, 400);
+    if (password.length < 8 || password.length > 128) return json({ error: 'Password must be 8 to 128 characters.' }, 400);
 
     // The database only accepts new accounts whose email is on this list.
     const { error: listErr } = await admin.from('allowed_users').upsert({ email, full_name, role }, { onConflict: 'email' });
@@ -62,16 +82,18 @@ Deno.serve(async (req) => {
       const exists = /already|registered|exists/i.test(error.message);
       return json({ error: exists ? 'An account with this email already exists.' : error.message }, exists ? 409 : 400);
     }
+    await audit(user.id, 'user.create', data.user?.id ?? email, { email, role });
     return json({ id: data.user?.id, email });
   }
 
   if (body.action === 'set_password') {
     const id = String(body.user_id ?? '');
     const password = String(body.password ?? '');
-    if (!id) return json({ error: 'Missing user.' }, 400);
-    if (password.length < 8) return json({ error: 'Password must be at least 8 characters.' }, 400);
+    if (!/^[0-9a-f-]{36}$/i.test(id)) return json({ error: 'Missing user.' }, 400);
+    if (password.length < 8 || password.length > 128) return json({ error: 'Password must be 8 to 128 characters.' }, 400);
     const { error } = await admin.auth.admin.updateUserById(id, { password });
     if (error) return json({ error: error.message }, 400);
+    await audit(user.id, 'user.password', id);
     return json({ ok: true });
   }
 
