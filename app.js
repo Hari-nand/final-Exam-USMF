@@ -374,7 +374,10 @@ const fmt10 = (v) => v.toFixed(2);
 const sess10 = (s) => out10(s.points != null ? Number(s.points) : s.correct, s.total || s.answered);
 
 async function sessionsFor(userId) {
-  return check(await sb.from('sessions').select('id,mode,label,total,answered,correct,points,started_at,finished_at')
+  const cols = 'id,mode,label,total,answered,correct,points,started_at,finished_at';
+  const r = await sb.from('sessions').select(cols + ',details_cleared').eq('user_id', userId).gt('answered', 0).order('started_at').limit(500);
+  if (!r.error || !missingInDb(r.error)) return check(r);
+  return check(await sb.from('sessions').select(cols)
     .eq('user_id', userId).gt('answered', 0).order('started_at').limit(500));
 }
 
@@ -2123,7 +2126,7 @@ async function renderExamSetup() {
   const mpool = prefs.mockPool && (prefs.mockPool !== 'incorrect' || nWrong) ? prefs.mockPool : 'new';
 
   view.innerHTML = `
-    <div class="page-head"><div><h1>Mock exam</h1><p class="muted">A paper built to the official exam weights. Answers are revealed after you submit.</p><p class="muted small">Scoring: single-answer questions score 1 or 0. Multi-answer questions give partial marks: each correct option you pick earns a share, each wrong option takes a share away, and a question can score below 0. Your final mark is out of 10: total marks ÷ number of questions × 10 (lowest 0).</p></div></div>
+    <div class="page-head"><div><h1>Mock exam</h1><p class="muted">A paper built to the official exam weights. Answers are revealed after you submit.</p><p class="muted small">Scoring: single-answer questions score 1 or 0. Multi-answer questions give partial marks: each correct option you pick earns a share, each wrong option takes a share away, and a question can score below 0. Your final mark is out of 10: total marks ÷ number of questions × 10 (lowest 0). You can review your answers afterwards in Progress; answers are kept for your last 3 mock exams.</p></div></div>
     ${draft ? `<div class="card tight row-between" style="border-color:var(--warn)"><div class="row">${icon('clock')}<b>You have an unfinished test: ${esc(draft.label || '')}</b></div><div class="btn-row"><a class="btn primary" href="#/exam/run">Resume</a><button class="btn ghost" id="discard">Discard</button></div></div>` : ''}
     <div class="grid two">
       <section class="card" aria-labelledby="es">
@@ -2490,8 +2493,9 @@ async function progressHTML(userId) {
       ${mocks.slice().reverse().map((m) => `<tr><td>${esc(fmtDate(m.started_at))}</td><td class="n"><b>${fmt10(sess10(m))}</b>/10</td>
         <td class="n"><span class="acc ${accClass(sessPct(m))}">${sessPct(m)}%</span></td><td class="n">${sessScore(m)}</td>
         <td class="n small">${m.finished_at ? Math.max(1, Math.round((Date.parse(m.finished_at) - Date.parse(m.started_at)) / 60000)) + ' min' : '<span class="muted">not finished</span>'}</td>
-        <td class="n"><a class="btn sm" href="#/mockreview/${m.id}">${icon('eye')}Review</a></td></tr>`).join('')}
-      </tbody></table></div></section>` : ''}
+        <td class="n">${m.details_cleared || !m.finished_at ? `<span class="muted small">${m.finished_at ? 'Score only' : ''}</span>` : `<a class="btn sm" href="#/mockreview/${m.id}">${icon('eye')}Review</a>`}</td></tr>`).join('')}
+      </tbody></table></div>
+      <p class="muted small">Answers are kept for review for the last 3 mock exams. For older ones, only the score is kept.</p></section>` : ''}
     <section class="card" aria-labelledby="pc"><h2 id="pc">Improvement curve</h2><p class="muted small">Every finished session, oldest to newest. Weighted mock exams are the solid line; topic tests (tutor and exam mode) are dashed.</p><div id="curve"></div></section>
     <section class="card" aria-labelledby="pd"><h2 id="pd">Readiness by discipline</h2>
       <p class="muted small">Accuracy per discipline, with its weight in the exam. The estimated score weights these the same way the real paper does.</p>
@@ -2527,10 +2531,16 @@ const REVIEW_FILTERS = [['all', 'All'], ['wrong', 'Wrong'], ['partial', 'Partly 
 async function renderMockReview(id) {
   const isAdmin = state.profile.role === 'admin';
   const view = shell(isAdmin ? 'admin' : 'progress', loading);
-  const { data: sess, error } = await sb.from('sessions').select('id,user_id,mode,label,total,answered,correct,points,started_at,finished_at').eq('id', id).maybeSingle();
+  const { data: sess, error } = await sb.from('sessions').select('id,user_id,mode,label,total,answered,correct,points,started_at,finished_at,details_cleared').eq('id', id).maybeSingle();
   if (error || !sess) { view.innerHTML = `<div class="card empty">${icon('alert')}<h2>Mock exam not found</h2><p class="muted">It may belong to someone else or have been removed.</p><a class="btn" href="#/progress">Back to Progress</a></div>`; return; }
   const mine = sess.user_id === state.profile.id;
   const back = mine ? '#/progress' : `#/admin/learner/${sess.user_id}`;
+  if (sess.details_cleared) {
+    view.innerHTML = `<div class="card empty">${icon('exam')}<h2>Review no longer available</h2>
+      <p class="muted">Answers are kept for review for the last 3 mock exams only. This one scored <b>${fmt10(sess10(sess))}/10</b> (${sessPct(sess)}%) on ${esc(fmtDate(sess.started_at))}.</p>
+      <a class="btn" href="${back}">${icon('left')}Back</a></div>`;
+    return;
+  }
   const [meta, answers, who] = await Promise.all([
     loadMeta(),
     fetchAll(() => sb.from('answers').select('question_id,selected,is_correct,mark,answered_at').eq('session_id', id).order('answered_at')),
@@ -2845,7 +2855,7 @@ async function renderAdminInsights() {
     sb.rpc('admin_overview'),
     sb.rpc('progress_stats').then(check),
     sb.from('profiles').select('id,full_name,email,role,active').then(check),
-    fetchAll(() => sb.from('sessions').select('id,user_id,label,total,answered,correct,points,started_at,finished_at').eq('mode', 'mock').not('finished_at', 'is', null).order('started_at', { ascending: false })),
+    fetchAll(() => sb.from('sessions').select('id,user_id,label,total,answered,correct,points,started_at,finished_at,details_cleared').eq('mode', 'mock').not('finished_at', 'is', null).order('started_at', { ascending: false })),
     sb.rpc('admin_most_missed', { p_limit: 20, p_min: 3 }),
   ]);
   const learners = people.filter((p) => p.active && p.role !== 'admin');
@@ -2896,7 +2906,7 @@ async function renderAdminInsights() {
       <div class="table-wrap"><table><thead><tr><th>Learner</th><th>Date</th><th class="n">Final mark</th><th class="n">Score</th><th class="n">Marks</th><th class="n">Change</th><th class="n">Time</th><th></th></tr></thead><tbody>
       ${mockRows.map((m) => { const pv = prevOf(m); const d = pv ? Math.round(100 * (sess10(m) - sess10(pv))) / 100 : null; const mins = Math.round((Date.parse(m.finished_at) - Date.parse(m.started_at)) / 60000);
         return `<tr><td>${esc(name.get(m.user_id) || 'Learner')}</td><td class="small">${esc(fmtDate(m.started_at))}</td><td class="n"><b>${fmt10(sess10(m))}</b>/10</td><td class="n"><span class="acc ${accClass(sessPct(m))}">${sessPct(m)}%</span></td><td class="n small">${esc(sessScore(m))}</td>
-          <td class="n">${d === null ? '<span class="muted">first</span>' : `<span class="acc ${d >= 0 ? 'hi' : 'lo'}">${d > 0 ? '+' : ''}${d.toFixed(2)}</span>`}</td><td class="n small">${mins} min</td><td class="n"><a class="btn sm" href="#/mockreview/${m.id}">${icon('eye')}Review</a></td></tr>`; }).join('') || '<tr><td colspan="8" class="muted">No mock exams finished yet.</td></tr>'}
+          <td class="n">${d === null ? '<span class="muted">first</span>' : `<span class="acc ${d >= 0 ? 'hi' : 'lo'}">${d > 0 ? '+' : ''}${d.toFixed(2)}</span>`}</td><td class="n small">${mins} min</td><td class="n">${m.details_cleared ? '<span class="muted small">Score only</span>' : `<a class="btn sm" href="#/mockreview/${m.id}">${icon('eye')}Review</a>`}</td></tr>`; }).join('') || '<tr><td colspan="8" class="muted">No mock exams finished yet.</td></tr>'}
       </tbody></table></div></section>
 
     <section class="card" aria-labelledby="inX"><h2 id="inX">${icon('alert')}Most missed questions</h2>
