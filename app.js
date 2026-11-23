@@ -770,6 +770,8 @@ async function router() {
     route = 'admin/' + (parts[1] || 'learners'); param = parts[2];
   } else if (route === 'exam' && parts[1]) {
     route = 'exam/' + parts[1];
+  } else if (route === 'mockreview') {
+    return renderMockReview(+parts[1]);
   } else if (route === 'feedback') {
     param = parts[1];
   } else if (route === 'account' && parts[1] === 'backup') {
@@ -2483,6 +2485,13 @@ async function progressHTML(userId) {
       <div class="stat"><span class="label">${icon('check')}Accuracy</span><span class="value">${pct(overall.correct, overall.attempts)}</span><span class="hint">${nWrong.toLocaleString()} incorrect · ${nMarked.toLocaleString()} marked</span></div>
       <div class="stat"><span class="label">${icon('exam')}Mock exams</span><span class="value">${mocks.length}</span><span class="hint">${best === null ? 'None yet' : `Best ${fmt10(best10)}/10 · latest ${fmt10(sess10(mocks[mocks.length - 1]))}/10`}</span></div>
     </div>
+    ${mocks.length ? `<section class="card" aria-labelledby="pmk"><h2 id="pmk">${icon('exam')}Mock exams</h2>
+      <div class="table-wrap"><table><thead><tr><th>Date</th><th class="n">Final mark</th><th class="n">Score</th><th class="n">Marks</th><th class="n">Time</th><th></th></tr></thead><tbody>
+      ${mocks.slice().reverse().map((m) => `<tr><td>${esc(fmtDate(m.started_at))}</td><td class="n"><b>${fmt10(sess10(m))}</b>/10</td>
+        <td class="n"><span class="acc ${accClass(sessPct(m))}">${sessPct(m)}%</span></td><td class="n">${sessScore(m)}</td>
+        <td class="n small">${m.finished_at ? Math.max(1, Math.round((Date.parse(m.finished_at) - Date.parse(m.started_at)) / 60000)) + ' min' : '<span class="muted">not finished</span>'}</td>
+        <td class="n"><a class="btn sm" href="#/mockreview/${m.id}">${icon('eye')}Review</a></td></tr>`).join('')}
+      </tbody></table></div></section>` : ''}
     <section class="card" aria-labelledby="pc"><h2 id="pc">Improvement curve</h2><p class="muted small">Every finished session, oldest to newest. Weighted mock exams are the solid line; topic tests (tutor and exam mode) are dashed.</p><div id="curve"></div></section>
     <section class="card" aria-labelledby="pd"><h2 id="pd">Readiness by discipline</h2>
       <p class="muted small">Accuracy per discipline, with its weight in the exam. The estimated score weights these the same way the real paper does.</p>
@@ -2510,6 +2519,87 @@ async function renderMyProgress() {
   wireAnki(view, meta, pool);
 }
 
+
+/* =========================================================================
+   Mock exam review: every answer of one finished mock, for the learner and the admin
+   ========================================================================= */
+const REVIEW_FILTERS = [['all', 'All'], ['wrong', 'Wrong'], ['partial', 'Partly right'], ['right', 'Right']];
+async function renderMockReview(id) {
+  const isAdmin = state.profile.role === 'admin';
+  const view = shell(isAdmin ? 'admin' : 'progress', loading);
+  const { data: sess, error } = await sb.from('sessions').select('id,user_id,mode,label,total,answered,correct,points,started_at,finished_at').eq('id', id).maybeSingle();
+  if (error || !sess) { view.innerHTML = `<div class="card empty">${icon('alert')}<h2>Mock exam not found</h2><p class="muted">It may belong to someone else or have been removed.</p><a class="btn" href="#/progress">Back to Progress</a></div>`; return; }
+  const mine = sess.user_id === state.profile.id;
+  const back = mine ? '#/progress' : `#/admin/learner/${sess.user_id}`;
+  const [meta, answers, who] = await Promise.all([
+    loadMeta(),
+    fetchAll(() => sb.from('answers').select('question_id,selected,is_correct,mark,answered_at').eq('session_id', id).order('answered_at')),
+    mine ? null : sb.from('profiles').select('full_name,email').eq('id', sess.user_id).maybeSingle().then((r) => r.data),
+  ]);
+  const qs = await fetchQuestions([...new Set(answers.map((a) => a.question_id))]);
+  const qById = new Map(qs.map((q) => [q.id, q]));
+  const partialScoring = sess.points != null;
+  const rows = answers.map((a, i) => {
+    const q = qById.get(a.question_id); const sel = new Set(a.selected || []);
+    const mark = a.mark != null ? Number(a.mark) : a.is_correct ? 1 : 0;
+    const kind = a.is_correct ? 'right' : mark > 0 ? 'partial' : 'wrong';
+    const t = q && meta.topicById.get(q.category_id); const d = t && meta.discById.get(t.discipline_id);
+    return { n: i + 1, a, q, sel, mark, kind, t, d };
+  });
+  const unanswered = Math.max(0, (sess.total || 0) - answers.length);
+  const counts = { right: rows.filter((r) => r.kind === 'right').length, partial: rows.filter((r) => r.kind === 'partial').length, wrong: rows.filter((r) => r.kind === 'wrong').length };
+  const byDisc = new Map();
+  for (const r of rows) { const k = r.d ? r.d.id : 0; const x = byDisc.get(k) || { d: r.d, n: 0, marks: 0 }; x.n++; x.marks += r.mark; byDisc.set(k, x); }
+  const discRows = [...byDisc.values()].sort((a, b) => (b.n - b.marks) - (a.n - a.marks));
+  const mins = sess.finished_at ? Math.max(1, Math.round((Date.parse(sess.finished_at) - Date.parse(sess.started_at)) / 60000)) : null;
+  const ui = { f: 'all', disc: 'all' };
+  const qCard = (r) => {
+    if (!r.q) return `<li class="card rv-q rv-${r.kind}"><p class="muted">Question #${r.a.question_id} is no longer in the bank.</p></li>`;
+    const key = new Set(r.q.correct || []);
+    return `<li class="card rv-q rv-${r.kind}" data-kind="${r.kind}" data-disc="${r.d ? r.d.id : 0}">
+      <div class="row-between"><span><b>${r.n}.</b> ${r.d ? `<span class="chip pri">${esc(r.d.name)}</span>` : ''} ${r.t && (!r.d || r.t.name !== r.d.name) ? `<span class="chip">${esc(r.t.name)}</span>` : ''} <span class="chip">${r.q.qtype}</span> <span class="chip">#${r.q.id}</span></span>
+        <span class="chip ${r.kind === 'right' ? 'ok' : r.kind === 'partial' ? 'warn' : 'bad'}">${r.kind === 'right' ? 'Right' : r.kind === 'partial' ? 'Partly right' : 'Wrong'} · ${r.mark > 0 ? '+' : ''}${fmtMark(r.mark)}</span></div>
+      <p class="rv-text">${esc(r.q.question)}</p>
+      <ol class="rv-opts">${r.q.options.map((o, i) => { const picked = r.sel.has(i); const ok = key.has(i);
+        const cls = picked && ok ? 'hit' : picked ? 'miss' : ok ? 'missed' : '';
+        const tag = picked && ok ? `${icon('check')}Picked · correct` : picked ? `${icon('x')}Picked · wrong` : ok ? 'Correct, not picked' : '';
+        return `<li class="${cls}"><b>${LETTERS[i]}</b> <span>${esc(o)}</span>${tag ? `<span class="rv-tag">${tag}</span>` : ''}</li>`; }).join('')}</ol>
+      ${!r.sel.size ? '<p class="small muted">No option was picked.</p>' : ''}
+      ${r.q.explanation ? `<p class="small"><b>Explanation:</b> ${esc(r.q.explanation)}</p>` : ''}
+    </li>`;
+  };
+  view.innerHTML = `
+    <div class="page-head"><div><a class="small" href="${back}">${icon('left')}${mine ? 'Back to Progress' : 'Back to ' + esc(who?.full_name || who?.email || 'the learner')}</a>
+      <h1>Mock exam review</h1>
+      <p class="muted">${mine ? '' : `<b>${esc(who?.full_name || who?.email || 'Learner')}</b> · `}${esc(fmtDate(sess.started_at))}${mins ? ` · ${mins} min` : ''}${sess.finished_at ? '' : ' · not finished'}</p></div></div>
+    <div class="grid stats">
+      <div class="stat"><span class="label">${icon('exam')}Final mark</span><span class="value">${fmt10(sess10(sess))}<small>/10</small></span><span class="hint">${sessPct(sess)}% · ${sessScore(sess)}</span></div>
+      <div class="stat"><span class="label">${icon('check')}Right</span><span class="value">${counts.right}</span><span class="hint">of ${sess.total} questions</span></div>
+      <div class="stat"><span class="label">${icon('alert')}Partly right</span><span class="value">${counts.partial}</span><span class="hint">${partialScoring ? 'Multi-answer, some marks' : 'Not scored partially (older mock)'}</span></div>
+      <div class="stat"><span class="label">${icon('x')}Wrong</span><span class="value">${counts.wrong}</span><span class="hint">${unanswered ? `${unanswered} not answered` : 'All answered'}</span></div>
+    </div>
+    <section class="card"><h2>Marks lost by discipline</h2>
+      <div class="table-wrap"><table><thead><tr><th>Discipline</th><th class="n">Questions</th><th class="n">Marks</th><th class="n">Lost</th></tr></thead><tbody>
+      ${discRows.map((x) => `<tr><td>${esc(x.d ? x.d.name : 'Other')}</td><td class="n">${x.n}</td><td class="n">${fmtMark(x.marks)}</td><td class="n"><b>${fmtMark(x.n - x.marks)}</b></td></tr>`).join('')}
+      </tbody></table></div>
+      ${!mine ? '' : `<div class="btn-row" style="margin-top:12px"><button class="btn primary" id="rvPractise" ${counts.wrong + counts.partial ? '' : 'disabled'}>${icon('retry')}Practise the ${counts.wrong + counts.partial} I missed</button></div>`}
+    </section>
+    <section aria-labelledby="rvQ"><div class="row-between"><h2 id="rvQ">Every question</h2>
+      <div class="btn-row"><div class="seg" role="group" aria-label="Show">${REVIEW_FILTERS.map(([k, l]) => `<button class="btn sm ${k === 'all' ? 'primary' : 'ghost'}" data-f="${k}">${l}${k === 'all' ? ` (${rows.length})` : ` (${counts[k]})`}</button>`).join('')}</div>
+        <label class="sr" for="rvDisc">Discipline</label><select id="rvDisc"><option value="all">All disciplines</option>${discRows.filter((x) => x.d).map((x) => `<option value="${x.d.id}">${esc(x.d.name)}</option>`).join('')}</select></div></div>
+      ${unanswered ? `<p class="muted small">${unanswered} question${unanswered === 1 ? ' was' : 's were'} not answered and can't be listed.</p>` : ''}
+      <p class="muted small">Options are shown in the question bank's order (A–E). In the exam they were shuffled, so the letters may differ from what was on screen.</p>
+      <ol class="rv-list">${rows.map(qCard).join('')}</ol></section>`;
+  const apply = () => view.querySelectorAll('.rv-q[data-kind]').forEach((li) => { li.hidden = (ui.f !== 'all' && li.dataset.kind !== ui.f) || (ui.disc !== 'all' && li.dataset.disc !== ui.disc); });
+  view.querySelectorAll('[data-f]').forEach((b) => (b.onclick = () => { ui.f = b.dataset.f; view.querySelectorAll('[data-f]').forEach((x) => { x.classList.toggle('primary', x === b); x.classList.toggle('ghost', x !== b); }); apply(); }));
+  view.querySelector('#rvDisc').onchange = (e) => { ui.disc = e.target.value; apply(); };
+  const pr = view.querySelector('#rvPractise');
+  if (pr) pr.onclick = async () => {
+    pr.disabled = true;
+    try { await startTutor(rows.filter((r) => r.q && r.kind !== 'right').map((r) => r.q), `Mistakes from mock ${shortDate(sess.started_at)}`, null, true); }
+    catch (e) { pr.disabled = false; toast(errMsg(e), 'bad'); }
+  };
+}
 
 /* =========================================================================
    Anki export (incorrect / marked questions as an Anki import file)
@@ -2803,10 +2893,10 @@ async function renderAdminInsights() {
 
     <section class="card" aria-labelledby="inM"><h2 id="inM">${icon('exam')}Mock exam results</h2>
       <p class="muted small">${mockRows.length} finished mock exam${mockRows.length === 1 ? '' : 's'}${groupAvg !== null ? ` · group average ${fmt10(groupAvg)}/10` : ''}. Mocks from 22 Nov use partial marks for multi-answer questions.</p>
-      <div class="table-wrap"><table><thead><tr><th>Learner</th><th>Date</th><th class="n">Final mark</th><th class="n">Score</th><th class="n">Marks</th><th class="n">Change</th><th class="n">Time</th></tr></thead><tbody>
+      <div class="table-wrap"><table><thead><tr><th>Learner</th><th>Date</th><th class="n">Final mark</th><th class="n">Score</th><th class="n">Marks</th><th class="n">Change</th><th class="n">Time</th><th></th></tr></thead><tbody>
       ${mockRows.map((m) => { const pv = prevOf(m); const d = pv ? Math.round(100 * (sess10(m) - sess10(pv))) / 100 : null; const mins = Math.round((Date.parse(m.finished_at) - Date.parse(m.started_at)) / 60000);
         return `<tr><td>${esc(name.get(m.user_id) || 'Learner')}</td><td class="small">${esc(fmtDate(m.started_at))}</td><td class="n"><b>${fmt10(sess10(m))}</b>/10</td><td class="n"><span class="acc ${accClass(sessPct(m))}">${sessPct(m)}%</span></td><td class="n small">${esc(sessScore(m))}</td>
-          <td class="n">${d === null ? '<span class="muted">first</span>' : `<span class="acc ${d >= 0 ? 'hi' : 'lo'}">${d > 0 ? '+' : ''}${d.toFixed(2)}</span>`}</td><td class="n small">${mins} min</td></tr>`; }).join('') || '<tr><td colspan="7" class="muted">No mock exams finished yet.</td></tr>'}
+          <td class="n">${d === null ? '<span class="muted">first</span>' : `<span class="acc ${d >= 0 ? 'hi' : 'lo'}">${d > 0 ? '+' : ''}${d.toFixed(2)}</span>`}</td><td class="n small">${mins} min</td><td class="n"><a class="btn sm" href="#/mockreview/${m.id}">${icon('eye')}Review</a></td></tr>`; }).join('') || '<tr><td colspan="8" class="muted">No mock exams finished yet.</td></tr>'}
       </tbody></table></div></section>
 
     <section class="card" aria-labelledby="inX"><h2 id="inX">${icon('alert')}Most missed questions</h2>

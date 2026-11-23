@@ -512,3 +512,17 @@ table.kv td { overflow-wrap: anywhere; }
 .mfa-list { list-style: none; padding: 0; display: grid; gap: 8px; margin: 12px 0; }
 .mfa-list li { display: flex; justify-content: space-between; align-items: center; gap: 12px; border: 1px solid var(--line); border-radius: var(--radius-sm); padding: 10px 12px; }
 .auth .otp, .notice .otp { margin: 0 auto; display: block; }
+
+/* Mock exam review */
+.rv-list { list-style: none; padding: 0; margin: 12px 0; display: grid; gap: 12px; }
+.rv-q { border-left: 4px solid var(--line); }
+.rv-q.rv-right { border-left-color: var(--ok); }
+.rv-q.rv-partial { border-left-color: var(--warn); }
+.rv-q.rv-wrong { border-left-color: var(--bad); }
+.rv-text { font-weight: 600; margin: 10px 0; }
+.rv-opts { list-style: none; padding: 0; display: grid; gap: 6px; margin: 0 0 8px; }
+.rv-opts li { display: flex; gap: 10px; align-items: baseline; padding: 6px 10px; border-radius: var(--radius-sm); border: 1px solid transparent; }
+.rv-opts li.hit { background: color-mix(in srgb, var(--ok) 12%, transparent); border-color: var(--ok); }
+.rv-opts li.miss { background: color-mix(in srgb, var(--bad) 12%, transparent); border-color: var(--bad); }
+.rv-opts li.missed { border-color: var(--ok); border-style: dashed; }
+.rv-tag { margin-left: auto; font-size: .8rem; font-weight: 600; white-space: nowrap; display: inline-flex; gap: 4px; align-items: center; }
