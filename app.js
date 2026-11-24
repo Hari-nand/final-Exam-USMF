@@ -324,6 +324,8 @@ async function loadSets(force = false) {
   }
   return state.sets;
 }
+/** The exam countdown is for USMF Final 2026 learners only (admins see every set). */
+const hasUsmf = () => !!state.sets?.some((x) => x.id === USMF_SET);
 const currentSet = () => state.sets?.find((x) => x.id === state.setId) || null;
 function switchSet(id) {
   if (id === state.setId) return;
@@ -999,7 +1001,7 @@ function countdownHTML(list = upcomingExams()) {
 }
 const quoteHTML = () => `<blockquote class="cd-quote">${icon('target')}<span>${esc(quoteOfDay())}</span></blockquote>`;
 function countdownCard() {
-  if (state.setId !== USMF_SET) return '';
+  if (!hasUsmf()) return '';
   const list = upcomingExams();
   if (!list.length) return '';
   return `<section class="card countdown" aria-labelledby="cdH"><h2 id="cdH">${icon('clock')}Exam countdown</h2>${countdownHTML(list)}${quoteHTML()}</section>`;
@@ -1014,7 +1016,7 @@ function tickCountdowns() {
   }, 1000);
 }
 function openCountdownPopup() {
-  if (state.setId !== USMF_SET) return;
+  if (!hasUsmf()) return;
   const list = upcomingExams();
   if (!list.length) return;
   document.querySelector('.modal-back')?.remove();
@@ -2804,30 +2806,36 @@ const noticeStatus = (a) => { const now = Date.now(); if (Date.parse(a.show_from
 async function renderAdminNotices() {
   const view = shell('admin', loading);
   const [{ data: list, error }, reads, people] = await Promise.all([
-    sb.from('announcements').select('id,title,intro,items,issuer,show_from,show_until,created_at').order('show_from', { ascending: false }),
+    sb.from('announcements').select('id,title,intro,items,issuer,show_from,show_until,created_at,set_id').order('show_from', { ascending: false }),
     sb.from('notice_reads').select('announcement_id,user_id'),
     sb.from('profiles').select('id,full_name,email,role,active'),
+    loadSets(true),
   ]);
+  const accessRows = await fetchAll(() => sb.from('set_access').select('user_id,set_id').order('user_id')).catch(() => []);
+  const setName = (id) => state.sets?.find((x) => x.id === id)?.name || 'a removed set';
   if (error) throw error;
   const learners = (people.data || []).filter((p) => p.active && p.role !== 'admin');
+  const hasSet = new Set(accessRows.map((r) => r.user_id + ':' + r.set_id));
+  const audience = (a) => (a.set_id == null ? learners : learners.filter((l) => hasSet.has(l.id + ':' + a.set_id)));
   const readsBy = new Map(); for (const r of reads.data || []) { if (!readsBy.has(r.announcement_id)) readsBy.set(r.announcement_id, new Set()); readsBy.get(r.announcement_id).add(r.user_id); }
   view.innerHTML = `${adminTabs('notices')}
     <div class="row-between"><h1 style="margin:0">Notices</h1><button class="btn primary" id="newNotice">+ New notice</button></div>
-    <p class="muted">Notices show on every learner's Home page between their start and end time, until each learner taps "Got it".</p>
+    <p class="muted">Notices show on learners' Home page between their start and end time, until each learner taps "Got it". A notice for one question set is shown only to learners who have that set.</p>
     <div id="noticeEditor"></div>
-    <section class="card"><div class="table-wrap"><table><thead><tr><th>Notice</th><th>Status</th><th>Shown</th><th class="n">Read</th><th></th></tr></thead><tbody>
-    ${list.map((a) => { const [st, cls] = noticeStatus(a); const r = readsBy.get(a.id) || new Set(); const nRead = learners.filter((l) => r.has(l.id)).length;
+    <section class="card"><div class="table-wrap"><table><thead><tr><th>Notice</th><th>Shown to</th><th>Status</th><th>Shown</th><th class="n">Read</th><th></th></tr></thead><tbody>
+    ${list.map((a) => { const [st, cls] = noticeStatus(a); const r = readsBy.get(a.id) || new Set(); const aud = audience(a); const nRead = aud.filter((l) => r.has(l.id)).length;
       return `<tr><td><b>${esc(a.title)}</b>${a.intro ? `<br><span class="muted small">${esc(a.intro.length > 90 ? a.intro.slice(0, 90) + '…' : a.intro)}</span>` : ''}</td>
+        <td class="small">${a.set_id == null ? 'Everyone' : esc(setName(a.set_id)) + ' learners'}</td>
         <td><span class="chip ${cls}">${st}</span></td>
         <td class="small">${esc(absDate(a.show_from))}<br><span class="muted">${a.show_until ? 'until ' + esc(absDate(a.show_until)) : 'no end date'}</span></td>
-        <td class="n"><span title="${esc(learners.filter((l) => r.has(l.id)).map((l) => l.full_name || l.email).join(', ') || 'Nobody yet')}">${nRead}/${learners.length}</span></td>
-        <td><div class="btn-row" style="justify-content:flex-end"><button class="btn sm" data-edit-notice="${esc(a.id)}">Edit</button>${st === 'Ended' ? '' : `<button class="btn sm ghost" data-end-notice="${esc(a.id)}">End now</button>`}<button class="btn sm danger" data-del-notice="${esc(a.id)}">Delete</button></div></td></tr>`; }).join('') || '<tr><td colspan="5" class="muted">No notices yet.</td></tr>'}
-    </tbody></table></div><p class="muted small" style="margin:8px 0 0">Read = learners who tapped "Got it" (hover to see who). Taps from before 22 Nov were only saved on each device, so older notices show fewer reads.</p></section>`;
+        <td class="n"><span title="${esc(aud.filter((l) => r.has(l.id)).map((l) => l.full_name || l.email).join(', ') || 'Nobody yet')}">${nRead}/${aud.length}</span></td>
+        <td><div class="btn-row" style="justify-content:flex-end"><button class="btn sm" data-edit-notice="${esc(a.id)}">Edit</button>${st === 'Ended' ? '' : `<button class="btn sm ghost" data-end-notice="${esc(a.id)}">End now</button>`}<button class="btn sm danger" data-del-notice="${esc(a.id)}">Delete</button></div></td></tr>`; }).join('') || '<tr><td colspan="6" class="muted">No notices yet.</td></tr>'}
+    </tbody></table></div><p class="muted small" style="margin:8px 0 0">Read = learners shown the notice who tapped "Got it" (hover to see who). Taps from before 22 Nov were only saved on each device, so older notices show fewer reads.</p></section>`;
   const open = (a) => noticeEditor(view.querySelector('#noticeEditor'), a);
   view.querySelector('#newNotice').onclick = () => open(null);
   view.querySelectorAll('[data-edit-notice]').forEach((b) => (b.onclick = () => open(list.find((x) => x.id === b.dataset.editNotice))));
   view.querySelectorAll('[data-end-notice]').forEach((b) => (b.onclick = async () => {
-    if (!confirm('End this notice now? It disappears from Home for everyone.')) return;
+    if (!confirm('End this notice now? It disappears from Home for everyone it was shown to.')) return;
     try { check(await sb.from('announcements').update({ show_until: new Date().toISOString() }).eq('id', b.dataset.endNotice)); toast('Notice ended.', 'ok'); renderAdminNotices(); } catch (e) { toast(errMsg(e), 'bad'); }
   }));
   view.querySelectorAll('[data-del-notice]').forEach((b) => (b.onclick = async () => {
@@ -2849,6 +2857,8 @@ function noticeEditor(box, a) {
       <label class="field">Show from<input type="datetime-local" name="from" required value="${toLocalInput(a ? a.show_from : Date.now())}"></label>
       <label class="field">Show until<span class="help">Leave empty for no end date.</span><input type="datetime-local" name="until" value="${until ? toLocalInput(until) : ''}"></label>
     </div>
+    <label class="field">Shown to<span class="help">If the notice is about questions from one set, choose that set: only learners who have it will see the notice.</span>
+      <select name="audience"><option value="">Everyone</option>${(state.sets || []).map((x) => `<option value="${x.id}" ${a?.set_id === x.id ? 'selected' : ''}>Learners with ${esc(x.name)}</option>`).join('')}</select></label>
     <label class="field">Issued by<input name="issuer" maxlength="60" value="${esc(a?.issuer || 'ANYMS')}"></label>
     <h3 class="small muted" style="margin:16px 0 8px">Preview</h3><div id="nPreview"></div>
     <div class="btn-row"><button class="btn primary" type="submit">${icon('check')}${isNew ? 'Publish' : 'Save changes'}</button><button class="btn ghost" type="button" id="nCancel">Cancel</button></div>
@@ -2866,7 +2876,8 @@ function noticeEditor(box, a) {
   };
   const current = () => ({ id: a?.id || 'notice', title: f.title.value.trim(), intro: f.intro.value.trim() || null, issuer: f.issuer.value.trim() || 'ANYMS',
     items: items.filter(([, t, d]) => t.trim() || d.trim()).map(([ic, t, d]) => [ic, t.trim(), d.trim()]),
-    show_from: f.from.value ? new Date(f.from.value).toISOString() : new Date().toISOString(), show_until: f.until.value ? new Date(f.until.value).toISOString() : null });
+    show_from: f.from.value ? new Date(f.from.value).toISOString() : new Date().toISOString(), show_until: f.until.value ? new Date(f.until.value).toISOString() : null,
+    set_id: f.audience.value ? Number(f.audience.value) : null });
   const preview = () => {
     const html = updateCards.call(null, [{ ...current(), title: current().title || 'Title' }]);
     f.querySelector('#nPreview').innerHTML = html.replace(/data-dismiss-update="[^"]*"/, 'disabled');
