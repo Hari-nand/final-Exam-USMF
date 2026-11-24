@@ -306,12 +306,50 @@ function hideIdleWarning() { if (SEC.warnEl) { SEC.warnEl.remove(); SEC.warnEl =
 }, { passive: true, capture: true }));
 document.addEventListener('visibilitychange', () => { if (!document.hidden && state.profile) { checkIdle(); heartbeat(false); } });
 
-/** Disciplines, topics and question counts (cached until something changes). */
+/* =========================================================================
+   Question sets: separate question banks. Learners see the sets the admin gave them;
+   admins see every set. Everything else (topics, tests, mocks, progress) follows the
+   set chosen in the bar under the header.
+   ========================================================================= */
+const USMF_SET = 1;
+const setKey = () => `mcq-set-${state.profile?.id}`;
+async function loadSets(force = false) {
+  if (state.sets && !force) return state.sets;
+  const { data, error } = await sb.from('question_sets').select('id,name,sort').order('sort').order('id');
+  if (error) { if (!missingInDb(error)) throw error; state.sets = [{ id: USMF_SET, name: 'USMF Final 2026' }]; }
+  else state.sets = data;
+  if (!state.sets.some((x) => x.id === state.setId)) {
+    const saved = store.get(setKey());
+    state.setId = state.sets.some((x) => x.id === saved) ? saved : state.sets[0]?.id ?? null;
+  }
+  return state.sets;
+}
+const currentSet = () => state.sets?.find((x) => x.id === state.setId) || null;
+function switchSet(id) {
+  if (id === state.setId) return;
+  state.setId = id; store.set(setKey(), id);
+  state.meta = null; state.pool = null;
+  toast(`Switched to ${currentSet()?.name || 'question set'}.`, 'ok');
+  if (location.hash === '#/home' || !location.hash) router(); else location.hash = '#/home';
+}
+function setBar() {
+  if (!state.sets || state.sets.length < 2) return '';
+  return `<div class="setbar"><label>${icon('book')}<span>Question set</span>
+    <select id="setPick" aria-label="Question set">${state.sets.map((x) => `<option value="${x.id}" ${x.id === state.setId ? 'selected' : ''}>${esc(x.name)}</option>`).join('')}</select></label></div>`;
+}
+function renderNoSets() {
+  const view = shell('home', '');
+  view.innerHTML = `<div class="card empty">${icon('book')}<h2>No question sets yet</h2>
+    <p class="muted">The admin hasn't given your account access to a question set yet. Please ask them to add you, then reload this page.</p>
+    <a class="btn" href="#/feedback">${icon('chat')}Message the admin</a></div>`;
+}
+
+/** Disciplines, topics and question counts of the current set (cached until something changes). */
 async function loadMeta(force = false) {
-  if (state.meta && !force) return state.meta;
+  if (state.meta && !force && state.meta.setId === state.setId) return state.meta;
   const [d, c, counts] = await Promise.all([
-    sb.from('disciplines').select('id,name,profile,weight,sort').order('sort'),
-    sb.from('categories').select('id,name,discipline_id').order('name'),
+    sb.from('disciplines').select('id,name,profile,weight,sort').eq('set_id', state.setId).order('sort'),
+    sb.from('categories').select('id,name,discipline_id').eq('set_id', state.setId).order('name'),
     sb.rpc('category_counts'),
   ]);
   const disciplines = check(d).map((x) => ({ ...x, weight: Number(x.weight) }));
@@ -324,7 +362,7 @@ async function loadMeta(force = false) {
     x.total = sum(x.topics.map((t) => totals.get(t.id) || 0));
   }
   const orphans = topics.filter((t) => !discById.has(t.discipline_id));
-  state.meta = { disciplines, topics, totals, discById, topicById, orphans };
+  state.meta = { disciplines, topics, totals, discById, topicById, orphans, setId: state.setId };
   return state.meta;
 }
 
@@ -375,7 +413,7 @@ const sess10 = (s) => out10(s.points != null ? Number(s.points) : s.correct, s.t
 
 async function sessionsFor(userId) {
   const cols = 'id,mode,label,total,answered,correct,points,started_at,finished_at';
-  const r = await sb.from('sessions').select(cols + ',details_cleared').eq('user_id', userId).gt('answered', 0).order('started_at').limit(500);
+  const r = await sb.from('sessions').select(cols + ',details_cleared').eq('user_id', userId).eq('set_id', state.setId).gt('answered', 0).order('started_at').limit(500);
   if (!r.error || !missingInDb(r.error)) return check(r);
   return check(await sb.from('sessions').select(cols)
     .eq('user_id', userId).gt('answered', 0).order('started_at').limit(500));
@@ -723,9 +761,11 @@ function shell(active, inner) {
         </div>
       </div>
     </header>
+    ${setBar()}
     <main id="view" tabindex="-1">${inner}</main>
     <nav class="bottom-nav" aria-label="Main">${items.map(link).join('')}</nav>`;
   document.getElementById('signOut').onclick = () => signOutNow();
+  const pick = document.getElementById('setPick'); if (pick) pick.onchange = () => switchSet(+pick.value);
   document.getElementById('bellBtn').onclick = () => openNotifications();
   paintBell();
   if (p.role === 'admin') paintReportBadge();
@@ -765,6 +805,8 @@ async function router() {
     if (unread.length) return renderNoticeGate(unread);
     state.noticesOk = true;
   }
+  await loadSets().catch((e) => { console.warn(e); state.sets = state.sets || []; });
+  if (!state.setId && !location.hash.startsWith('#/admin') && !location.hash.startsWith('#/account') && !location.hash.startsWith('#/feedback')) return renderNoSets();
   const parts = location.hash.replace(/^#\/?/, '').split('/').filter(Boolean);
   let route = parts[0] || 'home';
   let param;
@@ -957,6 +999,7 @@ function countdownHTML(list = upcomingExams()) {
 }
 const quoteHTML = () => `<blockquote class="cd-quote">${icon('target')}<span>${esc(quoteOfDay())}</span></blockquote>`;
 function countdownCard() {
+  if (state.setId !== USMF_SET) return '';
   const list = upcomingExams();
   if (!list.length) return '';
   return `<section class="card countdown" aria-labelledby="cdH"><h2 id="cdH">${icon('clock')}Exam countdown</h2>${countdownHTML(list)}${quoteHTML()}</section>`;
@@ -971,6 +1014,7 @@ function tickCountdowns() {
   }, 1000);
 }
 function openCountdownPopup() {
+  if (state.setId !== USMF_SET) return;
   const list = upcomingExams();
   if (!list.length) return;
   document.querySelector('.modal-back')?.remove();
@@ -1000,7 +1044,7 @@ function readinessStatus(p) {
   return ['On track', 'ok'];
 }
 function readinessCard(r, overall, totalQs, lastMock) {
-  const final = EXAMS.find((e) => e.key === 'final');
+  const final = state.setId === USMF_SET ? EXAMS.find((e) => e.key === 'final') : null;
   const days = final ? Math.max(0, Math.ceil((Date.parse(final.at) - Date.now()) / 864e5)) : null;
   const list = r.per.filter((p) => p.d.total && p.d.weight > 0).sort((a, b) => b.d.weight - a.d.weight);
   const focus = list.filter((p) => readinessStatus(p)[0] !== 'On track').slice(0, 3);
@@ -1134,7 +1178,7 @@ const POOLS = [
 /** Every active question with this learner's status: unused / correct / incorrect, plus marked. */
 async function loadPool(uid = state.profile.id) {
   const [qs, prog, marks] = await Promise.all([
-    fetchAll(() => sb.from('questions').select('id,category_id,qtype').eq('active', true).order('id')),
+    fetchAll(() => sb.from('questions').select('id,category_id,qtype').eq('active', true).eq('set_id', state.setId).order('id')),
     fetchAll(() => sb.from('progress').select('question_id,last_correct').eq('user_id', uid).order('question_id')),
     fetchAll(() => sb.from('marks').select('question_id').eq('user_id', uid).order('question_id')),
   ]);
@@ -1231,7 +1275,7 @@ async function renderPractice() {
   view.querySelector('#mostMissed').onclick = async (e) => {
     const b = e.currentTarget; b.disabled = true;
     try {
-      const { data, error } = await sb.rpc('most_missed_ids', { p_limit: 20 });
+      const { data, error } = await sb.rpc('most_missed_ids', { p_limit: 20, p_set: state.setId });
       if (error) throw error;
       const qs = await fetchQuestions((data || []).map(Number));
       if (!qs.length) { toast('Not enough answers from the group yet. Try again later.', ''); b.disabled = false; return; }
@@ -1331,7 +1375,7 @@ async function startTest(o, pool) {
 }
 
 async function startTutor(qs, label, opts, review = false) {
-  const sessionId = check(await sb.rpc('start_session', { p_mode: review ? 'review' : 'topic', p_label: label, p_total: qs.length }));
+  const sessionId = check(await sb.rpc('start_session', { p_mode: review ? 'review' : 'topic', p_label: label, p_total: qs.length, p_set: state.setId }));
   if (!state.marks) await loadPool();
   closePracticeDraft();
   state.run = { opts, sessionId, label, i: 0, startedAt: Date.now(),
@@ -2214,7 +2258,7 @@ async function startExam(n, timed, mpool = 'new', pool = null) {
 async function startExamWith(qs, { mode, label, timed, opts = null }) {
   if (!state.marks) await loadPool();
   const items = qs.map((q) => ({ q, order: optionOrder(q.options), sel: new Set(), flagged: state.marks.has(q.id) }));
-  const sessionId = check(await sb.rpc('start_session', { p_mode: mode, p_label: label, p_total: items.length }));
+  const sessionId = check(await sb.rpc('start_session', { p_mode: mode, p_label: label, p_total: items.length, p_set: state.setId }));
   const old = state.drafts?.exam;
   if (old?.sessionId && old.sessionId !== sessionId) sb.rpc('finish_session', { p_session_id: old.sessionId }).then(() => {}, () => {});
   state.exam = { sessionId, mode, label, opts, timed, startedAt: Date.now(), endsAt: timed ? Date.now() + items.length * 60000 : null, i: 0, items };
@@ -2855,8 +2899,8 @@ async function renderAdminInsights() {
     sb.rpc('admin_overview'),
     sb.rpc('progress_stats').then(check),
     sb.from('profiles').select('id,full_name,email,role,active').then(check),
-    fetchAll(() => sb.from('sessions').select('id,user_id,label,total,answered,correct,points,started_at,finished_at,details_cleared').eq('mode', 'mock').not('finished_at', 'is', null).order('started_at', { ascending: false })),
-    sb.rpc('admin_most_missed', { p_limit: 20, p_min: 3 }),
+    fetchAll(() => sb.from('sessions').select('id,user_id,label,total,answered,correct,points,started_at,finished_at,details_cleared').eq('mode', 'mock').eq('set_id', state.setId).not('finished_at', 'is', null).order('started_at', { ascending: false })),
+    sb.rpc('admin_most_missed', { p_limit: 20, p_min: 3, p_set: state.setId }),
   ]);
   const learners = people.filter((p) => p.active && p.role !== 'admin');
   const name = new Map(people.map((p) => [p.id, p.full_name || p.email]));
@@ -3110,12 +3154,16 @@ function paintPresence(root, presence) {
 
 async function renderAdminLearners() {
   const view = shell('admin', loading);
-  const [profiles, stats, sessions, events] = await Promise.all([
+  const [profiles, stats, sessions, events, sets, access] = await Promise.all([
     sb.from('profiles').select('*').order('created_at').then(check),
     sb.rpc('progress_stats').then(check),
-    fetchAll(() => sb.from('sessions').select('user_id,mode,answered,correct,total,started_at').gt('answered', 0).order('started_at')),
+    fetchAll(() => sb.from('sessions').select('user_id,mode,answered,correct,total,started_at').eq('set_id', state.setId).gt('answered', 0).order('started_at')),
     loadLoginEvents(7),
+    loadSets(true),
+    sb.from('set_access').select('user_id,set_id').then(({ data, error }) => (error ? [] : data)),
   ]);
+  const setName = new Map(sets.map((x) => [x.id, x.name]));
+  const accessOf = (uid) => access.filter((a) => a.user_id === uid).map((a) => a.set_id);
   const presence = await loadPresence();
   const byUser = new Map();
   for (const r of stats) { if (!byUser.has(r.user_id)) byUser.set(r.user_id, []); byUser.get(r.user_id).push(r); }
@@ -3132,12 +3180,14 @@ async function renderAdminLearners() {
         <label class="field">Temporary password<span class="input-btn"><input name="password" minlength="8" required autocomplete="off"><button type="button" class="btn sm" id="gen">Generate</button></span><span class="help">At least 8 characters. They can change it under Account.</span></label>
         <label class="field">Role<select name="role"><option value="learner">Learner</option><option value="admin">Admin</option></select></label>
       </div>
+      <fieldset class="field"><legend>Question sets</legend><div class="btn-row">${sets.map((x) => `<label class="choice inline"><input type="checkbox" name="sets" value="${x.id}" ${x.id === USMF_SET ? 'checked' : ''}> ${esc(x.name)}</label>`).join('')}</div>
+        <span class="help">The learner can only practise and take mocks in the sets ticked here. Admins always see every set.</span></fieldset>
       <div class="btn-row"><button class="btn primary" type="submit">Create account</button><button class="btn ghost" type="button" id="cancelAdd">Cancel</button></div>
       <p class="form-error" id="addErr" role="alert"></p>
     </form>
     <div id="created"></div>
     <section class="card"><div class="table-wrap"><table>
-      <thead><tr><th>Name</th><th>Email</th><th class="n">Practised</th><th class="n">Accuracy</th><th class="n">Mock exams</th><th class="n">Latest mock</th><th>Last active</th>${events ? '<th>Last sign-in</th>' : ''}<th>Account</th></tr></thead>
+      <thead><tr><th>Name</th><th>Email</th><th class="n">Practised</th><th class="n">Accuracy</th><th class="n">Mock exams</th><th class="n">Latest mock</th><th>Question sets</th><th>Last active</th>${events ? '<th>Last sign-in</th>' : ''}<th>Account</th></tr></thead>
       <tbody>${profiles.map((p) => {
         const s = rollUp(byUser.get(p.id) || []); const ss = sessByUser.get(p.id) || []; const mocks = ss.filter((x) => x.mode === 'mock');
         const last = ss.length ? ss[ss.length - 1].started_at : s.last;
@@ -3145,6 +3195,7 @@ async function renderAdminLearners() {
           <td><a href="#/admin/learner/${p.id}">${esc(p.full_name || '–')}</a>${p.role === 'admin' ? ' <span class="chip pri">admin</span>' : ''}</td>
           <td>${esc(p.email)}</td><td class="n">${s.answered}</td><td class="n">${pct(s.correct, s.attempts)}</td><td class="n">${mocks.length}</td>
           <td class="n">${mocks.length ? pct(mocks[mocks.length - 1].correct, mocks[mocks.length - 1].answered) : '–'}</td>
+          <td>${p.role === 'admin' ? '<span class="muted small">All sets</span>' : accessOf(p.id).map((id) => `<span class="chip">${esc(setName.get(id) || '?')}</span>`).join(' ') || '<span class="chip warn">None</span>'}</td>
           <td><div data-presence="${p.id}"></div><span class="small">${fmtDate(last)}</span></td>${events ? (() => {
             const mine = events.filter((e) => e.user_id === p.id); const lastIn = mine.find((e) => e.event === 'login'); const fl = sharingFlags(mine);
             return `<td>${lastIn ? `${esc(lastIn.device || '')}${lastIn.country ? ' · ' + esc(lastIn.country) : ''}<br><span class="muted small">${fmtDate(lastIn.at)}</span>` : '<span class="muted">–</span>'}${fl.length ? `<br><span class="chip bad" title="${esc(fl.join(' · '))}">${icon('alert')}Possible sharing</span>` : ''}</td>`;
@@ -3174,7 +3225,12 @@ async function renderAdminLearners() {
     if (password.length < 8) { err.textContent = 'The password must be at least 8 characters. Use Generate for a random one.'; form.password.focus(); return; }
     err.textContent = ''; btn.disabled = true; btn.textContent = 'Creating…';
     try {
-      await adminAction({ action: 'create_user', email, full_name: name, role, password });
+      const made = await adminAction({ action: 'create_user', email, full_name: name, role, password });
+      const chosen = fd.getAll('sets').map(Number);
+      if (made?.id && chosen.length) {
+        const { error: e2 } = await sb.from('set_access').insert(chosen.map((set_id) => ({ user_id: made.id, set_id })));
+        if (e2) toast(`Account created, but question-set access wasn't saved: ${errMsg(e2)}. Set it on the learner's page.`, 'bad');
+      }
       form.hidden = true; form.reset();
       view.querySelector('#created').innerHTML = `<div class="card created"><h2>${icon('check')} Account created for ${esc(name)}</h2><p>Send them these sign-in details:</p>
         <pre id="creds">Link: ${esc(location.href.split('#')[0])}\nEmail: ${esc(email)}\nPassword: ${esc(password)}</pre>
@@ -3226,6 +3282,25 @@ function devicesCard(p, devs) {
   </section>`;
 }
 
+async function paintSetAccess(box, p) {
+  const [sets, { data: rows, error }] = await Promise.all([loadSets(true), sb.from('set_access').select('set_id,granted_at').eq('user_id', p.id)]);
+  if (error) { box.innerHTML = `<p class="muted">${missingInDb(error) ? 'Question sets are not switched on yet.' : esc(errMsg(error))}</p>`; return; }
+  const has = new Map(rows.map((r) => [r.set_id, r.granted_at]));
+  box.innerHTML = `${p.role === 'admin' ? '<p class="muted small">Admins can use every set. The ticks matter only if this account becomes a learner.</p>' : '<p class="muted small">The learner can only practise and take mocks in the ticked sets.</p>'}
+    <form id="setForm"><ul class="set-list">${sets.map((x) => `<li><label class="choice"><input type="checkbox" name="s" value="${x.id}" ${has.has(x.id) ? 'checked' : ''}><span><b>${esc(x.name)}</b>${has.has(x.id) ? `<small>Since ${esc(fmtDate(has.get(x.id), false))}</small>` : ''}</span></label></li>`).join('')}</ul>
+    <button class="btn primary sm">Save access</button></form>`;
+  box.querySelector('#setForm').onsubmit = async (e) => {
+    e.preventDefault();
+    const want = new Set([...box.querySelectorAll('input[name=s]:checked')].map((i) => +i.value));
+    const add = [...want].filter((x) => !has.has(x)); const del = [...has.keys()].filter((x) => !want.has(x));
+    try {
+      if (add.length) check(await sb.from('set_access').insert(add.map((set_id) => ({ user_id: p.id, set_id }))));
+      if (del.length) check(await sb.from('set_access').delete().eq('user_id', p.id).in('set_id', del));
+      toast(add.length || del.length ? 'Access saved.' : 'Nothing changed.', 'ok'); paintSetAccess(box, p);
+    } catch (x) { toast(errMsg(x), 'bad'); }
+  };
+}
+
 async function renderAdminLearner(id) {
   const view = shell('admin', loading);
   const p = check(await sb.from('profiles').select('*').eq('id', id).maybeSingle());
@@ -3241,6 +3316,7 @@ async function renderAdminLearner(id) {
     <a class="btn ghost sm" href="#/admin/learners">${icon('left')}All learners</a>
     <div class="page-head"><div><h1>${esc(p.full_name || p.email)}</h1><p class="muted">${esc(p.email)} · ${p.role === 'admin' ? 'Admin' : 'Learner'} · ${p.active ? 'Active' : 'Disabled'} · added ${fmtDate(p.created_at, false)}</p></div></div>
     ${html}
+    <section class="card" aria-labelledby="qsH"><h2 id="qsH">${icon('book')}Question sets</h2><div id="setAccess"><p class="muted">Loading…</p></div></section>
     <section class="card"><h2>Manage account</h2>
       <div class="grid two">
         <form id="nameForm" class="inline-form"><label class="field">Name<input name="full_name" value="${esc(p.full_name || '')}"></label><button class="btn">Save</button></form>
@@ -3257,6 +3333,7 @@ async function renderAdminLearner(id) {
       ${flags.length ? `<p class="chip bad">${icon('alert')}Possible sharing in the last 7 days: ${esc(flags.join(' · '))}</p>` : '<p class="muted small">No signs of account sharing in the last 7 days.</p>'}
       ${eventsTable(events.slice(0, 30))}</section>` : ''}
     ${devicesCard(p, devs)}`;
+  paintSetAccess(view.querySelector('#setAccess'), p);
   drawCurveInto(view.querySelector('#curve'), sessions);
   const so = view.querySelector('#signOutAll');
   if (so) so.onclick = async () => {
@@ -3329,7 +3406,7 @@ async function importQuestions(items, skipDuplicates, onProgress) {
   const discId = new Map(meta.disciplines.map((d) => [d.name.toLowerCase(), d.id]));
   const newDiscs = [...new Set(valid.map((v) => v.discipline))].filter((n) => !discId.has(n.toLowerCase()));
   if (newDiscs.length) {
-    const made = check(await sb.from('disciplines').insert(newDiscs.map((name, k) => ({ name, profile: 'Other', weight: 0, sort: 100 + k }))).select('id,name'));
+    const made = check(await sb.from('disciplines').insert(newDiscs.map((name, k) => ({ name, profile: 'Other', weight: 0, sort: 100 + k, set_id: state.setId }))).select('id,name'));
     made.forEach((d) => discId.set(d.name.toLowerCase(), d.id));
   }
   const topicKey = new Map(meta.topics.map((t) => [t.name.toLowerCase(), t]));
@@ -3348,7 +3425,7 @@ async function importQuestions(items, skipDuplicates, onProgress) {
   const norm = (t) => String(t).toLowerCase().replace(/\s+/g, ' ').trim();
   const key = (cid, text, options) => [cid, norm(text), ...options.map(norm)].join('|');
   const seen = new Set();
-  if (skipDuplicates) (await fetchAll(() => sb.from('questions').select('category_id,question,options').order('id'))).forEach((q) => seen.add(key(q.category_id, q.question, q.options)));
+  if (skipDuplicates) (await fetchAll(() => sb.from('questions').select('category_id,question,options').eq('set_id', state.setId).order('id'))).forEach((q) => seen.add(key(q.category_id, q.question, q.options)));
   const rows = []; let skipped = 0;
   for (const v of valid) {
     const cid = topicKey.get(v.topic.toLowerCase()).id; const k = key(cid, v.question, v.options);
@@ -3460,7 +3537,11 @@ async function renderAdminQuestions() {
   view.innerHTML = `${adminTabs('questions')}
     <div class="row-between"><h1 style="margin:0">Questions &amp; blueprint</h1>
       <div class="btn-row"><button class="btn" id="exportBtn">${icon('download')}Export JSON</button><button class="btn primary" id="newQ">+ New question</button></div></div>
-    <p class="muted">${totalQs.toLocaleString()} active questions in ${meta.topics.length} topics across ${meta.disciplines.length} disciplines.</p>
+    <p class="muted">Question set <b>${esc(currentSet()?.name || '')}</b>: ${totalQs.toLocaleString()} active questions in ${meta.topics.length} topics across ${meta.disciplines.length} disciplines. Switch sets in the bar at the top.</p>
+    <section class="card" aria-labelledby="qsM"><h2 id="qsM">${icon('book')}Question sets</h2>
+      <ul class="set-list">${(state.sets || []).map((x) => `<li class="row-between"><span><b>${esc(x.name)}</b>${x.id === state.setId ? ' <span class="chip pri">Showing</span>' : ''}</span><button class="btn sm ghost" data-rename="${x.id}">Rename</button></li>`).join('')}</ul>
+      <form id="newSet" class="inline-form"><label class="field">New set<input name="name" maxlength="60" placeholder="For example: Surgery 4th year"></label><button class="btn">Add set</button></form>
+      <p class="muted small">A new set starts empty: switch to it, then use Bulk import or New question. Give learners access on their page under Admin → Learners.</p></section>
     <div id="editor"></div>
     <div class="grid two">
       <section class="card" aria-labelledby="bw"><h2 id="bw">Exam blueprint</h2>
@@ -3538,8 +3619,21 @@ async function renderAdminQuestions() {
   };
 
   // export
+  view.querySelector('#newSet').onsubmit = async (e) => {
+    e.preventDefault(); const name = e.target.name.value.trim();
+    if (name.length < 2) { toast('Type a name for the set.', 'bad'); return; }
+    try { check(await sb.from('question_sets').insert({ name, sort: (state.sets?.length || 0) + 1 })); await loadSets(true); toast(`Added "${name}".`, 'ok'); renderAdminQuestions(); }
+    catch (x) { toast(/duplicate|unique/i.test(errMsg(x)) ? 'A set with that name already exists.' : errMsg(x), 'bad'); }
+  };
+  view.querySelectorAll('[data-rename]').forEach((b) => (b.onclick = async () => {
+    const x = state.sets.find((y) => y.id === +b.dataset.rename);
+    const name = (prompt('New name for this question set:', x.name) || '').trim();
+    if (!name || name === x.name) return;
+    try { check(await sb.from('question_sets').update({ name }).eq('id', x.id)); await loadSets(true); toast('Renamed.', 'ok'); renderAdminQuestions(); }
+    catch (err) { toast(errMsg(err), 'bad'); }
+  }));
   view.querySelector('#exportBtn').onclick = async () => {
-    const qs = await fetchAll(() => sb.from('questions').select('category_id,question,options,qtype,correct,explanation,active').order('id'));
+    const qs = await fetchAll(() => sb.from('questions').select('category_id,question,options,qtype,correct,explanation,active').eq('set_id', state.setId).order('id'));
     const data = qs.map((q) => { const t = meta.topicById.get(q.category_id); const d = t && meta.discById.get(t.discipline_id);
       return { discipline: d?.name, topic: t?.name, type: q.qtype, question: q.question, options: q.options, answer: q.correct.map((c) => LETTERS[c]).join(''), explanation: q.explanation || undefined, ...(q.active ? {} : { hidden: true }) }; });
     download(`question-bank-${new Date().toISOString().slice(0, 10)}.json`, JSON.stringify(data, null, 1));
@@ -3615,7 +3709,7 @@ async function renderAdminQuestions() {
       if (!SEC.leaving && !state.flash) state.flash = 'You were signed out. This happens when your account is signed in on another device or your session ends.';
       stopSecurityTimers();
       clearInterval(state.timer);
-      Object.assign(state, { profile: null, meta: null, run: null, exam: null, examResult: null, drafts: null, noticesOk: false, mfaOk: false });
+      Object.assign(state, { profile: null, meta: null, run: null, exam: null, examResult: null, drafts: null, noticesOk: false, mfaOk: false, sets: null, setId: null, pool: null });
       document.getElementById('toasts').replaceChildren();
       setTimeout(() => (location.hash === '' || location.hash === '#/login' ? router() : (location.hash = '#/login')), 0);
     }
