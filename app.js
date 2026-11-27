@@ -2144,6 +2144,7 @@ function allocate(n, discs) {
 const MOCK_POOLS = [
   ['new', 'New questions first', 'Unanswered questions, by the exam weights. Repeats come in only when a discipline has none left (your incorrect ones first).'],
   ['incorrect', 'Incorrect only', 'Second round: only questions you got wrong, still by the exam weights.'],
+  ['correct', 'Correct only', 'Revision: only questions you got right last time, so you keep them fresh. Still by the exam weights.'],
   ['any', 'Any questions', 'Random from the whole bank, ignoring what you have done.'],
 ];
 
@@ -2169,7 +2170,8 @@ async function renderExamSetup() {
   const by = poolByDisc(meta, pool);
   const nNew = pool.filter((q) => q.status === 'unused').length;
   const nWrong = pool.filter((q) => q.status === 'incorrect').length;
-  const mpool = prefs.mockPool && (prefs.mockPool !== 'incorrect' || nWrong) ? prefs.mockPool : 'new';
+  const nRight = pool.filter((q) => q.status === 'correct').length;
+  const mpool = prefs.mockPool && (prefs.mockPool !== 'incorrect' || nWrong) && (prefs.mockPool !== 'correct' || nRight) ? prefs.mockPool : 'new';
 
   view.innerHTML = `
     <div class="page-head"><div><h1>Mock exam</h1><p class="muted">A paper built to the official exam weights. Answers are revealed after you submit.</p><p class="muted small">Scoring: single-answer questions score 1 or 0. Multi-answer questions give partial marks: each correct option you pick earns a share, each wrong option takes a share away, and a question can score below 0. Your final mark is out of 10: total marks ÷ number of questions × 10 (lowest 0). You can review your answers afterwards in Progress; answers are kept for your last 3 mock exams.</p></div></div>
@@ -2178,8 +2180,8 @@ async function renderExamSetup() {
       <section class="card" aria-labelledby="es">
         <fieldset><legend>Questions</legend>
           <div class="choices one">${MOCK_POOLS.map(([v, t, s]) => {
-            const n = v === 'new' ? nNew : v === 'incorrect' ? nWrong : totalQs;
-            return `<label class="choice"><input type="radio" name="mpool" value="${v}" ${mpool === v ? 'checked' : ''} ${v === 'incorrect' && !nWrong ? 'disabled' : ''}><span><b>${t} <span class="count num">(${n.toLocaleString()})</span></b><small>${s}</small></span></label>`;
+            const n = v === 'new' ? nNew : v === 'incorrect' ? nWrong : v === 'correct' ? nRight : totalQs;
+            return `<label class="choice"><input type="radio" name="mpool" value="${v}" ${mpool === v ? 'checked' : ''} ${(v === 'incorrect' && !nWrong) || (v === 'correct' && !nRight) ? 'disabled' : ''}><span><b>${t} <span class="count num">(${n.toLocaleString()})</span></b><small>${s}</small></span></label>`;
           }).join('')}</div>
         </fieldset>
         <fieldset><legend id="es">Paper length</legend>
@@ -2200,7 +2202,7 @@ async function renderExamSetup() {
   const choice = () => ({ n: +view.querySelector('input[name=size]:checked').value, mpool: view.querySelector('input[name=mpool]:checked').value, timed: view.querySelector('#timed').checked });
   const draw = () => {
     const c = choice();
-    const capped = meta.disciplines.map((d) => ({ ...d, total: c.mpool === 'incorrect' ? by.get(d.id).incorrect.length : by.get(d.id).all.length }));
+    const capped = meta.disciplines.map((d) => ({ ...d, total: c.mpool === 'incorrect' || c.mpool === 'correct' ? by.get(d.id)[c.mpool].length : by.get(d.id).all.length }));
     const rows = allocate(c.n, capped);
     const byId = new Map(rows.map((r) => [r.d.id, r.k]));
     let lastProfile = '';
@@ -2217,7 +2219,7 @@ async function renderExamSetup() {
     const total = sum(rows.map((r) => r.k));
     view.querySelector('#runway').textContent = c.mpool === 'new'
       ? (left ? `About ${left} more ${c.n}-question paper${left === 1 ? '' : 's'} of all-new questions before the first discipline runs out. After that, that discipline repeats your incorrect questions first.` : 'At least one discipline has run out of new questions, so this paper will include some repeats (incorrect ones first).')
-      : c.mpool === 'incorrect' ? (total < c.n ? `You have ${total} incorrect questions in weighted disciplines, so this paper will have ${total}.` : '') : '';
+      : c.mpool === 'incorrect' || c.mpool === 'correct' ? (total < c.n ? `You have ${total} ${c.mpool} questions in weighted disciplines, so this paper will have ${total}.` : '') : '';
     view.querySelector('#go').disabled = !total;
   };
   view.addEventListener('change', () => {
@@ -2241,18 +2243,18 @@ async function startExam(n, timed, mpool = 'new', pool = null) {
   const meta = await loadMeta();
   pool = pool || (await loadPool());
   const by = poolByDisc(meta, pool);
-  const capped = meta.disciplines.map((d) => ({ ...d, total: mpool === 'incorrect' ? by.get(d.id).incorrect.length : by.get(d.id).all.length }));
+  const capped = meta.disciplines.map((d) => ({ ...d, total: mpool === 'incorrect' || mpool === 'correct' ? by.get(d.id)[mpool].length : by.get(d.id).all.length }));
   const rows = allocate(n, capped);
   const ids = shuffle(rows.flatMap((r) => {
     const g = by.get(r.d.id);
-    const order = mpool === 'incorrect' ? shuffle(g.incorrect)
+    const order = mpool === 'incorrect' || mpool === 'correct' ? shuffle(g[mpool])
       : mpool === 'any' ? shuffle(g.all)
       : [...shuffle(g.unused), ...shuffle(g.incorrect), ...shuffle(g.correct)];
     return order.slice(0, r.k).map((q) => q.id);
   }));
   if (!ids.length) throw new Error('No questions available for this mock exam.');
   const qs = await fetchQuestions(ids);
-  const tag = { new: 'New', incorrect: 'Incorrect', any: 'Any' }[mpool];
+  const tag = { new: 'New', incorrect: 'Incorrect', correct: 'Correct', any: 'Any' }[mpool];
   await startExamWith(qs, { mode: 'mock', label: `Mock exam · ${qs.length} questions · ${tag}`, timed, opts: { mock: true, n, mpool } });
 }
 
